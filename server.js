@@ -3,6 +3,32 @@ const nodemailer = require("nodemailer");
 const path = require("path");
 const fs = require("fs");
 
+/**
+ * Si Render no inyecta variables, puedes subir un archivo `.env` en la raíz
+ * (copia `.env.example` → `.env` y rellena). Solo rellena claves vacías en process.env.
+ */
+function loadEnvFile() {
+  const fp = path.join(__dirname, ".env");
+  if (!fs.existsSync(fp)) return;
+  const text = fs.readFileSync(fp, "utf8");
+  for (let line of text.split(/\r?\n/)) {
+    line = line.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq < 1) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    const cur = process.env[key];
+    if (cur == null || String(cur).trim() === "") {
+      process.env[key] = val;
+    }
+  }
+}
+loadEnvFile();
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -93,8 +119,8 @@ function createTransporter() {
 
   if (!user || !pass) {
     throw new Error(
-      "Faltan credenciales SMTP. En Render: SMTP_USER y SMTP_PASS (y opcional SMTP_HOST, SMTP_PORT, FROM_EMAIL). " +
-        "O usa smtp.json / SMTP_FALLBACK_* en server.js."
+      "Faltan SMTP_USER y SMTP_PASS. Ponlas en Render (Environment) o crea un archivo .env en la raíz " +
+        "(copia .env.example → .env) o smtp.json; luego sube a GitHub y vuelve a desplegar."
     );
   }
 
@@ -112,12 +138,14 @@ app.get("/health", (_req, res) => {
   const hasUser = Boolean(user);
   const hasPass = Boolean(pass);
   const fileOk = fs.existsSync(path.join(__dirname, "smtp.json"));
+  const envFileOk = fs.existsSync(path.join(__dirname, ".env"));
   res.status(200).json({
     ok: true,
     smtpConfigured: hasUser && hasPass,
     hasSmtpUser: hasUser,
     hasSmtpPass: hasPass,
     hasSmtpJsonFile: fileOk,
+    hasEnvFile: envFileOk,
   });
 });
 
