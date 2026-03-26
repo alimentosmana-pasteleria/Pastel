@@ -36,9 +36,9 @@ app.use(express.json({ limit: "20mb" }));
 app.use(express.static(__dirname));
 
 /**
- * Último recurso si Render NO inyecta variables de entorno:
- * rellena aquí usuario y clave SMTP de Brevo (mismo valor que en Brevo → SMTP).
- * Déjalos vacíos "" si usas solo Render Environment o smtp.json
+ * No pongas claves reales aquí si subes el repo a GitHub (es público o se escanea).
+ * Usa solo Render → Environment (SMTP_USER, SMTP_PASS, FROM_EMAIL) o un archivo `.env` local
+ * que NO se sube (está en .gitignore).
  */
 const SMTP_FALLBACK_USER = "";
 const SMTP_FALLBACK_PASS = "";
@@ -73,8 +73,8 @@ function readSmtpJsonFile() {
 
 function getSmtpUser() {
   let u = firstEnv(["SMTP_USER", "BREVO_SMTP_LOGIN", "SMTP_LOGIN", "MAIL_USER", "EMAIL_USER"]);
-  if (!u) u = readSmtpJsonFile().user;
   if (!u) u = String(SMTP_FALLBACK_USER || "").trim();
+  if (!u) u = readSmtpJsonFile().user;
   return u;
 }
 
@@ -86,15 +86,15 @@ function getSmtpPass() {
     "BREVO_SMTP_PASSWORD",
     "SMTP_KEY",
   ]);
-  if (!p) p = readSmtpJsonFile().pass;
   if (!p) p = String(SMTP_FALLBACK_PASS || "").trim();
+  if (!p) p = readSmtpJsonFile().pass;
   return p;
 }
 
 function getFromEmail() {
   let f = firstEnv(["FROM_EMAIL", "MAIL_FROM", "SMTP_FROM"]);
-  if (!f) f = readSmtpJsonFile().from;
   if (!f) f = String(SMTP_FALLBACK_FROM || "").trim();
+  if (!f) f = readSmtpJsonFile().from;
   return f || getSmtpUser();
 }
 
@@ -119,8 +119,7 @@ function createTransporter() {
 
   if (!user || !pass) {
     throw new Error(
-      "Faltan SMTP_USER y SMTP_PASS. Ponlas en Render (Environment) o crea un archivo .env en la raíz " +
-        "(copia .env.example → .env) o smtp.json; luego sube a GitHub y vuelve a desplegar."
+      "Error SMTP: falta usuario o clave. Abre server.js y rellena SMTP_FALLBACK_USER y SMTP_FALLBACK_PASS (líneas de arriba), guarda, sube a GitHub y despliega."
     );
   }
 
