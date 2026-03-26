@@ -100,8 +100,21 @@ function readSmtpJsonFile() {
   }
 }
 
-/** Una sola variable en Render (JSON) evita errores de nombre: {"user":"…@smtp-brevo.com","pass":"xsmtpsib-…"} */
+/**
+ * Credenciales en una sola variable Render (elige UNA opción):
+ * - SMTP_PIPE = login@smtp-brevo.com|xsmtpsib-... (un solo | entre login y clave; más fácil que JSON)
+ * - BREVO_SMTP_JSON = {"user":"…","pass":"…"}
+ */
 function readBundledSmtpFromEnv() {
+  const pipeRaw = envRaw("SMTP_PIPE") || envRaw("BREVO_SMTP_PIPE");
+  if (pipeRaw) {
+    const sep = pipeRaw.indexOf("|");
+    if (sep > 0) {
+      const user = pipeRaw.slice(0, sep).trim();
+      const pass = pipeRaw.slice(sep + 1).trim();
+      if (user && pass) return { user, pass };
+    }
+  }
   const raw = envRaw("BREVO_SMTP_JSON") || envRaw("SMTP_JSON") || envRaw("SMTP_CREDENTIALS_JSON");
   if (!raw) return null;
   try {
@@ -260,7 +273,7 @@ function createTransporter() {
 
   if (!user || !pass) {
     throw new Error(
-      "Error SMTP: falta login o clave. En Render → Environment usa SMTP_USER (login …@smtp-brevo.com) y SMTP_PASS (clave xsmtpsib-), o una sola variable BREVO_SMTP_JSON con JSON {\"user\":\"…\",\"pass\":\"…\"}. Guarda y haz Manual Deploy."
+      "Error SMTP: Render no está pasando credenciales a Node. Crea SMTP_PIPE = tu_login@smtp-brevo.com|tu_clave_xsmtpsib (un | en medio) y Save + Manual Deploy. O SMTP_USER + SMTP_PASS. Comprueba /health → envKeyNamesMatching."
     );
   }
   if (looksLikeBrevoSecret(user)) {
@@ -287,7 +300,7 @@ app.get("/health", (_req, res) => {
   res.status(200).json({
     ok: true,
     /** Si esto no aparece en tu /health, Render no está sirviendo este código (revisa Root Directory y el último deploy). */
-    codeStamp: "pasteleria-smtp-v3-brevo",
+    codeStamp: "pasteleria-smtp-v4",
     smtpConfigured: hasUser && hasPass,
     hasSmtpLogin: Boolean(getSmtpLoginOnly()),
     hasSmtpUser: hasUser,
@@ -298,6 +311,7 @@ app.get("/health", (_req, res) => {
     renderEnvHint: {
       SMTP_USER_set: Boolean(envRaw("SMTP_USER")),
       SMTP_PASS_set: Boolean(envRaw("SMTP_PASS")),
+      SMTP_PIPE_set: Boolean(envRaw("SMTP_PIPE")),
       BREVO_SMTP_JSON_set: Boolean(envRaw("BREVO_SMTP_JSON")),
     },
     /** Nombres de variables presentes (sin valores), por si hay un typo */
@@ -305,6 +319,24 @@ app.get("/health", (_req, res) => {
       /^(SMTP|BREVO|MAIL_|EMAIL_|FROM_)/i.test(k)
     ),
   });
+});
+
+/** Prueba real contra Brevo (sin enviar correo). Si falla, el mensaje viene del servidor SMTP. */
+app.get("/api/smtp-verify", async (_req, res) => {
+  try {
+    const transporter = createTransporter();
+    await transporter.verify();
+    res.status(200).json({ ok: true, brevo: "conexion-smtp-ok", codeStamp: "pasteleria-smtp-v4" });
+  } catch (err) {
+    const msg = err?.message || "verify failed";
+    res.status(500).json({
+      ok: false,
+      error: msg,
+      codeStamp: "pasteleria-smtp-v4",
+      hint:
+        "Si credenciales están bien: remitente FROM_EMAIL debe estar verificado en Brevo. Revisa también SMTP_PIPE (login|clave).",
+    });
+  }
 });
 
 async function handleSendOrder(req, res) {

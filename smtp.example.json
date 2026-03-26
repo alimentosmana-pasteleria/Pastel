@@ -1,0 +1,7 @@
+{
+  "host": "smtp-relay.brevo.com",
+  "port": "587",
+  "user": "TU_LOGIN_SMTP_DE_BREVO",
+  "pass": "TU_CLAVE_SMTP_DE_BREVO",
+  "from": "tu_correo_verificado@ejemplo.com"
+}
