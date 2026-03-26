@@ -1206,7 +1206,7 @@
     const P = { tamano: null, tipo: null, capas: null, sabores: [], personalizacion: null, fotoBase64: null };
 
     // ── API backend ──
-    const ORDER_API_ENDPOINT = "/api/send-order";
+    const ORDER_API_ENDPOINT = window.location.origin + "/api/send-order";
 
     // ── Init ──
     document.getElementById("hdr-slogan").textContent = CONFIG.slogan;
@@ -1521,7 +1521,7 @@
         return true;
       } catch (err) {
         console.error("Send order error:", err);
-        const detalleError = err?.text || err?.message || "Error desconocido";
+        let detalleError = err?.text || err?.message || "Error desconocido";
         toast("❌ No se pudo enviar el pedido: " + detalleError);
         return false;
       }
