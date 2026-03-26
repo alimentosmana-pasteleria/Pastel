@@ -956,6 +956,12 @@
       correo: "contacto.alimentosmana@gmail.com",
       whatsappNumero: "+50245504231",
       moneda: "Q",
+      /**
+       * Si abres esta página desde el MISMO sitio donde corre server.js (ej. todo en Render), déjalo "".
+       * Si la página está en otro lugar (disco, Netlify, otro dominio) y solo el API está en Render,
+       * pon aquí la URL de tu servicio sin barra final, ej: "https://pasteleria-mana.onrender.com"
+       */
+      apiBaseUrl: "",
     };
     const PRECIOS = {
       ambiente: { p: 300, m: 450, g: 600, xg: 800 },
@@ -1205,8 +1211,14 @@
     // ── Estado ──
     const P = { tamano: null, tipo: null, capas: null, sabores: [], personalizacion: null, fotoBase64: null };
 
-    // ── API backend ──
-    const ORDER_API_ENDPOINT = window.location.origin + "/api/send-order";
+    // ── API backend (debe coincidir con el servidor que tiene POST /api/send-order) ──
+    const ORDER_API_ENDPOINT = (function () {
+      const base = String(CONFIG.apiBaseUrl || "").trim().replace(/\/$/, "");
+      if (base) return base + "/api/send-order";
+      const o = window.location.origin;
+      if (!o || o === "null") return "";
+      return o + "/api/send-order";
+    })();
 
     // ── Init ──
     document.getElementById("hdr-slogan").textContent = CONFIG.slogan;
@@ -1508,6 +1520,10 @@
         pdfBase64: pdfAdjunto.pdfBase64,
       };
 
+      if (!ORDER_API_ENDPOINT) {
+        toast("❌ Configura CONFIG.apiBaseUrl con la URL de Render (o abre la página desde esa misma URL).");
+        return false;
+      }
       toast("📤 Enviando correo…");
       try {
         const resp = await fetch(ORDER_API_ENDPOINT, {

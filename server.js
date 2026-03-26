@@ -32,6 +32,15 @@ loadEnvFile();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Permite que el formulario llame al API desde otro origen si CONFIG.apiBaseUrl apunta a este servidor.
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ limit: "20mb" }));
 app.use(express.static(__dirname));
 
@@ -46,11 +55,29 @@ const SMTP_FALLBACK_PASS = "";
 const SMTP_FALLBACK_USER = "";
 const SMTP_FALLBACK_FROM = "contacto.alimentosmana@gmail.com";
 
+function looksLikeBrevoSecret(s) {
+  return /xsmtpsib-|xkeysib-/i.test(String(s || ""));
+}
+
+/** Una entrada de process.env por nombre exacto o misma palabra en otro casing (Render/Git a veces alteran). */
+function envRaw(key) {
+  let v = process.env[key];
+  if (v != null && String(v).trim() !== "") return String(v).trim();
+  const lowFix = String(key || "").toLowerCase();
+  for (const envKey of Object.keys(process.env)) {
+    if (envKey.toLowerCase() === lowFix) {
+      const v2 = process.env[envKey];
+      if (v2 != null && String(v2).trim() !== "") return String(v2).trim();
+    }
+  }
+  return "";
+}
+
 /** Render/Brevo a veces nombran distinto las variables; probamos alias comunes. */
 function firstEnv(keys) {
   for (const k of keys) {
-    const v = process.env[k];
-    if (v != null && String(v).trim() !== "") return String(v).trim();
+    const v = envRaw(k);
+    if (v !== "") return v;
   }
   return "";
 }
@@ -101,6 +128,8 @@ function getSmtpPass() {
     "BREVO_SMTP_KEY",
     "BREVO_SMTP_PASSWORD",
     "SMTP_KEY",
+    "MAIL_PASSWORD",
+    "EMAIL_PASSWORD",
   ]);
   if (!p) p = String(SMTP_FALLBACK_PASS || "").trim();
   if (!p) p = readSmtpJsonFile().pass;
@@ -112,10 +141,6 @@ function brevoPassFromMisassignedUser(rawUser, rawPass) {
   if (looksLikeBrevoSecret(rawUser)) return rawUser;
   if (looksLikeBrevoSecret(rawPass)) return rawPass;
   return rawPass;
-}
-
-function looksLikeBrevoSecret(s) {
-  return /xsmtpsib-|xkeysib-/i.test(String(s || ""));
 }
 
 function getFromEmail() {
@@ -208,10 +233,16 @@ app.get("/health", (_req, res) => {
   res.status(200).json({
     ok: true,
     smtpConfigured: hasUser && hasPass,
+    hasSmtpLogin: Boolean(getSmtpLoginOnly()),
     hasSmtpUser: hasUser,
     hasSmtpPass: hasPass,
     hasSmtpJsonFile: fileOk,
     hasEnvFile: envFileOk,
+    /** Si falta algo, en Render → Environment crea SMTP_USER y SMTP_PASS y pulsa Save + Redeploy. */
+    renderEnvHint: {
+      SMTP_USER_set: Boolean(envRaw("SMTP_USER")),
+      SMTP_PASS_set: Boolean(envRaw("SMTP_PASS")),
+    },
   });
 });
 
@@ -257,4 +288,11 @@ app.get("*", (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Servidor escuchando en puerto ${PORT}`);
+  const okLogin = Boolean(getSmtpLoginOnly());
+  const okPass = Boolean(getSmtpPass());
+  if (!okLogin || !okPass) {
+    console.warn(
+      "[SMTP] Falta login o clave en este servidor. Render: Environment → SMTP_USER (…@smtp-brevo.com) y SMTP_PASS (xsmtpsib-…), luego Manual Deploy."
+    );
+  }
 });
