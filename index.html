@@ -1191,10 +1191,10 @@
         <div class="btn-group">
           <button class="btn btn-next"
             style="width:100%;background:linear-gradient(135deg,#e11d48,#be123c);box-shadow:0 5px 20px rgba(225,29,72,.45);"
-            id="btn-concretar" onclick="concretarPedido()">🎁 Concretar Pedido (Enviar Automáticamente)</button>
+            id="btn-concretar" onclick="concretarPedido()">🎁 Concretar pedido — enviar PDF al correo</button>
         </div>
         <div class="btn-group" style="margin-top:10px">
-          <button class="btn btn-whatsapp" onclick="enviarWhatsApp()">💬 Enviar por WhatsApp</button>
+          <button class="btn btn-whatsapp" onclick="enviarWhatsAppConPDF()">💬 O enviar por WhatsApp (con PDF)</button>
         </div>
         <div class="sep"></div>
         <button class="btn btn-nuevo" onclick="reiniciar()">🎂 Hacer otro pedido</button>
@@ -1219,6 +1219,9 @@
       if (!o || o === "null") return "";
       return o + "/api/send-order";
     })();
+
+    /** PDF + arranque Render gratuito: 120 s. */
+    const SEND_ORDER_TIMEOUT_MS = 120000;
 
     // ── Init ──
     document.getElementById("hdr-slogan").textContent = CONFIG.slogan;
@@ -1524,33 +1527,47 @@
         toast("❌ Configura CONFIG.apiBaseUrl con la URL de Render (o abre la página desde esa misma URL).");
         return false;
       }
-      toast("📤 Enviando correo…");
+      toast("📤 Enviando correo… (si usas Render gratis el 1.er intento puede tardar ~1 min)");
+      const ac = new AbortController();
+      const toId = setTimeout(() => ac.abort(), SEND_ORDER_TIMEOUT_MS);
       try {
         const resp = await fetch(ORDER_API_ENDPOINT, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
+          signal: ac.signal,
         });
+        clearTimeout(toId);
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
         toast("✅ ¡Pedido enviado con PDF adjunto! ID: " + folioPedido);
         return true;
       } catch (err) {
+        clearTimeout(toId);
         console.error("Send order error:", err);
-        let detalleError = err?.text || err?.message || "Error desconocido";
+        let detalleError = err?.message || "Error desconocido";
+        if (err && err.name === "AbortError") {
+          detalleError =
+            "Tiempo agotado. Abre tu URL de Render en otra pestaña, espera que cargue, luego reintenta el pedido (servicio dormido o PDF muy pesado).";
+        } else if (detalleError === "Failed to fetch" || detalleError.includes("NetworkError")) {
+          detalleError =
+            "No se contactó al servidor. Debes abrir la página desde la MISMA URL de Render donde está server.js (o pon CONFIG.apiBaseUrl con esa URL).";
+        }
         toast("❌ No se pudo enviar el pedido: " + detalleError);
         return false;
       }
     }
 
-    // ── WhatsApp ──
-    function enviarWhatsApp() {
+    // ── WhatsApp + PDF (100% en el navegador: sirve en InfinityFree, sin Render ni Brevo) ──
+    function textoPedidoWhatsApp() {
       const d = obtenerDatos();
       const ff = d.fecha ? new Date(d.fecha + "T12:00").toLocaleDateString("es-NI", { weekday: "long", year: "numeric", month: "long", day: "numeric" }) : "—";
-      const msg = `🎂 *Nuevo Pedido — Alimentos Maná*\n\n` +
+      return (
+        `🎂 *Nuevo Pedido — ${CONFIG.empresa}*\n\n` +
         `👤 *Cliente:* ${d.nombre}\n📞 *Teléfono:* ${d.tel}\n` +
         `📅 *Entrega:* ${ff}${d.hora ? " a las " + d.hora : ""}\n` +
         (d.direccion ? `📍 *Dirección:* ${d.direccion}\n` : "") +
+        (d.correo ? `📧 *Correo:* ${d.correo}\n` : "") +
         `\n🍰 *Detalle:*\n• Tamaño: ${sizeLabel[P.tamano] || "—"}\n` +
         `• Tipo: ${tiposLabel[P.tipo] || "—"}\n• Capas: ${P.capas || "—"}\n` +
         `• Sabores: ${P.sabores.join(" + ") || "—"}\n` +
@@ -1558,10 +1575,57 @@
         `\n🎨 *Diseño:* ${P.personalizacion === "custom" ? "Personalizado" : "Criterio del pastelero"}\n` +
         (P.personalizacion === "custom" && d.descCustom ? `📝 ${d.descCustom}\n` : "") +
         (P.personalizacion === "criterio" && d.notaCrit ? `📝 ${d.notaCrit}\n` : "") +
-        `\n💰 *Total estimado: Q ${calcPrecio().toLocaleString("es-NI")}*\n` +
-        `Nota: Adjunto mi pedido o comprobante en PDF.`;
-      window.open("https://wa.me/50245504231?text=" + encodeURIComponent(msg), "_blank");
-      toast("💬 Abriendo WhatsApp…");
+        `\n💰 *Total estimado: ${CONFIG.moneda} ${calcPrecio().toLocaleString("es-NI")}*\n\n` +
+        `📎 *Adjunto el PDF del pedido en este chat.*`
+      );
+    }
+
+    function waDigitos() {
+      return String(CONFIG.whatsappNumero || "").replace(/\D/g, "") || "50245504231";
+    }
+
+    async function enviarWhatsAppConPDF() {
+      const d = obtenerDatos();
+      if (!d.nombre || !d.tel) {
+        toast("⚠️ Completa nombre y teléfono antes de enviar");
+        return;
+      }
+      if (!validarPaso1()) return;
+      let pdfAdjunto;
+      try {
+        pdfAdjunto = construirPDFPedido();
+      } catch (e) {
+        console.error(e);
+        toast("❌ No se pudo generar el PDF.");
+        return;
+      }
+
+      const bytes = Uint8Array.from(atob(pdfAdjunto.pdfBase64), (c) => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: "application/pdf" });
+      const file = new File([blob], pdfAdjunto.filename, { type: "application/pdf" });
+      const msg = textoPedidoWhatsApp();
+
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({ files: [file], text: msg, title: "Pedido " + CONFIG.empresa });
+          toast("✅ Elige WhatsApp y envía el pedido con el PDF");
+          return;
+        } catch (e) {
+          if (e && e.name === "AbortError") return;
+        }
+      }
+
+      const a = document.createElement("a");
+      const url = URL.createObjectURL(blob);
+      a.href = url;
+      a.download = pdfAdjunto.filename;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      const maxLen = 3500;
+      const txt = msg.length > maxLen ? msg.slice(0, maxLen) + "\n\n…(detalle completo en el PDF descargado)" : msg;
+      window.open("https://wa.me/" + waDigitos() + "?text=" + encodeURIComponent(txt), "_blank");
+      toast("📥 PDF descargado → en WhatsApp pulsa 📎 y elige ese archivo");
     }
 
     // ── Toast ──
