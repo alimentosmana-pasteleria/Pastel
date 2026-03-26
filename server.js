@@ -29,6 +29,21 @@ function loadEnvFile() {
 }
 loadEnvFile();
 
+// #region agent log
+const AGENT_DEBUG_LOG = path.join(__dirname, "debug-cfd408.log");
+function agentDebugLog(payload) {
+  const line = JSON.stringify({
+    sessionId: "cfd408",
+    timestamp: Date.now(),
+    ...payload,
+  });
+  try {
+    fs.appendFileSync(AGENT_DEBUG_LOG, line + "\n");
+  } catch (_) {}
+  console.log("[DEBUG_CFD408]", line);
+}
+// #endregion
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -383,9 +398,44 @@ async function handleSendOrder(req, res) {
   try {
     const { toEmail, replyTo, subject, text, pdfFilename, pdfBase64 } = req.body || {};
 
+    // #region agent log
+    agentDebugLog({
+      hypothesisId: "H4",
+      location: "server.js:handleSendOrder",
+      message: "body snapshot",
+      data: {
+        hasToEmail: Boolean(toEmail),
+        hasSubject: Boolean(subject),
+        hasText: Boolean(text),
+        hasPdfName: Boolean(pdfFilename),
+        pdfB64Len: pdfBase64 ? String(pdfBase64).length : 0,
+      },
+    });
+    // #endregion
+
     if (!toEmail || !subject || !text || !pdfFilename || !pdfBase64) {
       return res.status(400).json({ error: "Faltan datos obligatorios para enviar el pedido" });
     }
+
+    // #region agent log
+    const _u = getSmtpUser();
+    const _p = getSmtpPass();
+    agentDebugLog({
+      hypothesisId: "H1",
+      location: "server.js:before createTransporter",
+      message: "smtp lengths (no secrets)",
+      data: {
+        userLen: _u ? String(_u).length : 0,
+        passLen: _p ? String(_p).length : 0,
+        pipeDefined: Boolean(envRaw("SMTP_PIPE")),
+        smtpUserDefined: Boolean(envRaw("SMTP_USER")),
+        smtpPassDefined: Boolean(envRaw("SMTP_PASS")),
+        smtpEnvKeyCount: Object.keys(process.env).filter((k) =>
+          /^(SMTP|BREVO|FROM_|MAIL_|EMAIL_)/i.test(k)
+        ).length,
+      },
+    });
+    // #endregion
 
     const transporter = createTransporter();
     const fromEmail = getFromEmail();
@@ -406,8 +456,29 @@ async function handleSendOrder(req, res) {
       ],
     });
 
+    // #region agent log
+    agentDebugLog({
+      hypothesisId: "H2",
+      location: "server.js:handleSendOrder",
+      message: "sendMail ok",
+      data: { ok: true },
+    });
+    // #endregion
+
     res.status(200).json({ ok: true, provider: "smtp" });
   } catch (error) {
+    // #region agent log
+    agentDebugLog({
+      hypothesisId: "H2",
+      location: "server.js:handleSendOrder catch",
+      message: "send-order failed",
+      data: {
+        errType: error?.name || "Error",
+        errSlice: String(error?.message || "").slice(0, 160),
+      },
+    });
+    // #endregion
+
     res.status(500).json({ error: error?.message || "Error interno al enviar pedido" });
   }
 }

@@ -1530,6 +1530,22 @@
       toast("📤 Enviando correo… (si usas Render gratis el 1.er intento puede tardar ~1 min)");
       const ac = new AbortController();
       const toId = setTimeout(() => ac.abort(), SEND_ORDER_TIMEOUT_MS);
+      // #region agent log
+      let _epHost = "no-url";
+      try { _epHost = new URL(ORDER_API_ENDPOINT).host; } catch (e) { _epHost = "invalid-url"; }
+      fetch("http://127.0.0.1:7683/ingest/b83d3fde-69c8-461f-9c18-c97bdcaefa9d", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "cfd408" },
+        body: JSON.stringify({
+          sessionId: "cfd408",
+          hypothesisId: "H3",
+          location: "index.html:enviarCorreo",
+          message: "fetch start",
+          data: { epHost: _epHost, bodyApproxLen: JSON.stringify(payload).length, pageOrigin: window.location.origin },
+          timestamp: Date.now(),
+        }),
+      }).catch(function () { });
+      // #endregion
       try {
         const resp = await fetch(ORDER_API_ENDPOINT, {
           method: "POST",
@@ -1539,12 +1555,40 @@
         });
         clearTimeout(toId);
         const data = await resp.json().catch(() => ({}));
+        // #region agent log
+        fetch("http://127.0.0.1:7683/ingest/b83d3fde-69c8-461f-9c18-c97bdcaefa9d", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "cfd408" },
+          body: JSON.stringify({
+            sessionId: "cfd408",
+            hypothesisId: "H3",
+            location: "index.html:enviarCorreo",
+            message: "fetch done",
+            data: { httpStatus: resp.status, ok: resp.ok, errHead: (data && data.error) ? String(data.error).slice(0, 120) : "" },
+            timestamp: Date.now(),
+          }),
+        }).catch(function () { });
+        // #endregion
         if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
         toast("✅ ¡Pedido enviado con PDF adjunto! ID: " + folioPedido);
         return true;
       } catch (err) {
         clearTimeout(toId);
         console.error("Send order error:", err);
+        // #region agent log
+        fetch("http://127.0.0.1:7683/ingest/b83d3fde-69c8-461f-9c18-c97bdcaefa9d", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "cfd408" },
+          body: JSON.stringify({
+            sessionId: "cfd408",
+            hypothesisId: "H3",
+            location: "index.html:enviarCorreo",
+            message: "fetch error",
+            data: { errName: err && err.name ? err.name : "", errMsg: err && err.message ? String(err.message).slice(0, 120) : "" },
+            timestamp: Date.now(),
+          }),
+        }).catch(function () { });
+        // #endregion
         let detalleError = err?.message || "Error desconocido";
         if (err && err.name === "AbortError") {
           detalleError =
