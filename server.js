@@ -100,6 +100,21 @@ function readSmtpJsonFile() {
   }
 }
 
+/** Una sola variable en Render (JSON) evita errores de nombre: {"user":"…@smtp-brevo.com","pass":"xsmtpsib-…"} */
+function readBundledSmtpFromEnv() {
+  const raw = envRaw("BREVO_SMTP_JSON") || envRaw("SMTP_JSON") || envRaw("SMTP_CREDENTIALS_JSON");
+  if (!raw) return null;
+  try {
+    const j = JSON.parse(raw);
+    return {
+      user: String(j.user || j.login || "").trim(),
+      pass: String(j.pass || j.password || j.key || "").trim(),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function looksLikeBrevoSmtpLogin(s) {
   return /@smtp-brevo\.com\s*$/i.test(String(s || "").trim());
 }
@@ -110,6 +125,9 @@ function looksLikeBrevoSmtpLogin(s) {
  * Si el login quedó en SMTP_PASS y la clave en SMTP_USER, también lo detectamos.
  */
 function getSmtpLoginOnly() {
+  const bundled = readBundledSmtpFromEnv();
+  if (bundled && bundled.user && !looksLikeBrevoSecret(bundled.user)) return bundled.user;
+
   const keys = ["BREVO_SMTP_LOGIN", "SMTP_LOGIN", "MAIL_USER", "EMAIL_USER", "SMTP_USER"];
   for (const k of keys) {
     const u = envRaw(k);
@@ -128,15 +146,27 @@ function getSmtpLoginOnly() {
   return "";
 }
 
+/**
+ * Valor "usuario" para auth (puede ser la clave si está mal colocada; createTransporter lo corrige).
+ * Importante: si solo existe SMTP_USER con xsmtpsib, antes quedaba "" y fallaba siempre.
+ */
 function getSmtpUser() {
+  const bundled = readBundledSmtpFromEnv();
+  if (bundled && bundled.user) return bundled.user;
+
   let u = getSmtpLoginOnly();
   if (u) return u;
   u = String(SMTP_FALLBACK_USER || "").trim();
   if (!u) u = readSmtpJsonFile().user;
+  if (!u) u = envRaw("SMTP_USER");
+  if (!u) u = envRaw("BREVO_SMTP_LOGIN");
   return u;
 }
 
 function getSmtpPass() {
+  const bundled = readBundledSmtpFromEnv();
+  if (bundled && bundled.pass) return bundled.pass;
+
   const passKeys = [
     "SMTP_PASS",
     "SMTP_PASSWORD",
@@ -230,7 +260,7 @@ function createTransporter() {
 
   if (!user || !pass) {
     throw new Error(
-      "Error SMTP: falta login o clave. En Brevo el login es …@smtp-brevo.com y la clave es xsmtpsib-… (Render: SMTP_USER + SMTP_PASS, o aquí SMTP_FALLBACK_LOGIN + SMTP_FALLBACK_PASS)."
+      "Error SMTP: falta login o clave. En Render → Environment usa SMTP_USER (login …@smtp-brevo.com) y SMTP_PASS (clave xsmtpsib-), o una sola variable BREVO_SMTP_JSON con JSON {\"user\":\"…\",\"pass\":\"…\"}. Guarda y haz Manual Deploy."
     );
   }
   if (looksLikeBrevoSecret(user)) {
@@ -266,7 +296,12 @@ app.get("/health", (_req, res) => {
     renderEnvHint: {
       SMTP_USER_set: Boolean(envRaw("SMTP_USER")),
       SMTP_PASS_set: Boolean(envRaw("SMTP_PASS")),
+      BREVO_SMTP_JSON_set: Boolean(envRaw("BREVO_SMTP_JSON")),
     },
+    /** Nombres de variables presentes (sin valores), por si hay un typo */
+    envKeyNamesMatching: Object.keys(process.env).filter((k) =>
+      /^(SMTP|BREVO|MAIL_|EMAIL_|FROM_)/i.test(k)
+    ),
   });
 });
 
