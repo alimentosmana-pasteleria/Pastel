@@ -5,7 +5,7 @@ Esta guía y el `server.js` actual usan **las mismas variables**: lo que pongas 
 ## 1) Subir proyecto a GitHub
 
 1. Crea un repositorio (o usa el que ya tienes).
-2. Sube: `index.html`, `server.js`, `package.json`, `package-lock.json`.
+2. Sube: `index.html`, `server.js`, `package.json`, `package-lock.json`, y si usas la opción B del paso 4, también **`.env`** (y deja **`.env.example`** como plantilla).
 
 ## 2) Brevo (correo SMTP)
 
@@ -30,9 +30,11 @@ Esta guía y el `server.js` actual usan **las mismas variables**: lo que pongas 
    - **Build Command**: `npm install`  
    - **Start Command**: `npm start**
 
-## 4) Variables de entorno en Render
+## 4) Credenciales SMTP (elige una forma)
 
-En **Environment Variables** agrega (Key exacto, Value sin comillas):
+### A) Solo Render (Environment Variables)
+
+En **Environment** agrega (Key exacto, Value sin comillas):
 
 | Key | Value (ejemplo Brevo) |
 |-----|------------------------|
@@ -42,9 +44,19 @@ En **Environment Variables** agrega (Key exacto, Value sin comillas):
 | `SMTP_PASS` | Tu clave SMTP de Brevo |
 | `FROM_EMAIL` | Tu correo remitente verificado |
 
-Si no pones `SMTP_HOST` / `SMTP_PORT`, el servidor usa por defecto `smtp-relay.brevo.com` y `587`.
+### B) Archivo `.env` en el proyecto (si Render no te “pasa” las variables al servidor)
 
-**Alternativa** (si Render fallara con las variables): archivo `smtp.json` en la raíz (ver `smtp.example.json`) o rellena `SMTP_FALLBACK_*` al inicio de `server.js`.
+1. Copia `.env.example` → `.env`.
+2. Abre `.env` y rellena `SMTP_USER`, `SMTP_PASS`, `FROM_EMAIL`.
+3. Sube **`.env`** a GitHub con el resto del proyecto y vuelve a desplegar.
+
+El `server.js` lee `.env` al arrancar y rellena lo que falte en `process.env`.
+
+> Si el repo es público, un `.env` con claves es un riesgo; usa repo privado o solo variables en Render.
+
+### C) Otras opciones
+
+- `smtp.json` (ver `smtp.example.json`), o constantes `SMTP_FALLBACK_*` al inicio de `server.js`.
 
 ## 5) Deploy
 

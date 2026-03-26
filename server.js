@@ -36,12 +36,14 @@ app.use(express.json({ limit: "20mb" }));
 app.use(express.static(__dirname));
 
 /**
- * No pongas claves reales aquí si subes el repo a GitHub (es público o se escanea).
- * Usa solo Render → Environment (SMTP_USER, SMTP_PASS, FROM_EMAIL) o un archivo `.env` local
- * que NO se sube (está en .gitignore).
+ * Render: preferible SMTP_USER + SMTP_PASS en Environment.
+ * Local / sin env: LOGIN = solo tu usuario SMTP Brevo (…@smtp-brevo.com); PASS = solo xsmtpsib-…
+ * No pongas la clave xsmtpsib en LOGIN (si las dos constantes son la clave, falla hasta corregir).
  */
-const SMTP_FALLBACK_USER = "xsmtpsib-fd866d5c21f7ef49f7a21645194f1a276066bcc4fca6a09ba44fa175009d13b8-KYjm8isECOJPBUWP";
-const SMTP_FALLBACK_PASS = "xsmtpsib-fd866d5c21f7ef49f7a21645194f1a276066bcc4fca6a09ba44fa175009d13b8-wbTqSOAU7pieOCls";
+const SMTP_FALLBACK_LOGIN = "";
+const SMTP_FALLBACK_PASS = "";
+/** @deprecated usar SMTP_FALLBACK_LOGIN + SMTP_FALLBACK_PASS; si rellenas esto, debe ser el login, no la clave */
+const SMTP_FALLBACK_USER = "";
 const SMTP_FALLBACK_FROM = "contacto.alimentosmana@gmail.com";
 
 /** Render/Brevo a veces nombran distinto las variables; probamos alias comunes. */
@@ -71,9 +73,23 @@ function readSmtpJsonFile() {
   }
 }
 
-function getSmtpUser() {
+function getSmtpLoginOnly() {
   let u = firstEnv(["SMTP_USER", "BREVO_SMTP_LOGIN", "SMTP_LOGIN", "MAIL_USER", "EMAIL_USER"]);
-  if (!u) u = String(SMTP_FALLBACK_USER || "").trim();
+  if (u && !looksLikeBrevoSecret(u)) return u;
+  u = String(SMTP_FALLBACK_LOGIN || "").trim();
+  if (u && !looksLikeBrevoSecret(u)) return u;
+  u = String(SMTP_FALLBACK_USER || "").trim();
+  if (u && !looksLikeBrevoSecret(u)) return u;
+  const j = readSmtpJsonFile();
+  u = String(j.user || j.login || "").trim();
+  if (u && !looksLikeBrevoSecret(u)) return u;
+  return "";
+}
+
+function getSmtpUser() {
+  let u = getSmtpLoginOnly();
+  if (u) return u;
+  u = String(SMTP_FALLBACK_USER || "").trim();
   if (!u) u = readSmtpJsonFile().user;
   return u;
 }
@@ -91,17 +107,48 @@ function getSmtpPass() {
   return p;
 }
 
+/** Si guardaste la clave por error en "usuario", recuperarla para auth. */
+function brevoPassFromMisassignedUser(rawUser, rawPass) {
+  if (looksLikeBrevoSecret(rawUser)) return rawUser;
+  if (looksLikeBrevoSecret(rawPass)) return rawPass;
+  return rawPass;
+}
+
+function looksLikeBrevoSecret(s) {
+  return /xsmtpsib-|xkeysib-/i.test(String(s || ""));
+}
+
 function getFromEmail() {
   let f = firstEnv(["FROM_EMAIL", "MAIL_FROM", "SMTP_FROM"]);
   if (!f) f = String(SMTP_FALLBACK_FROM || "").trim();
   if (!f) f = readSmtpJsonFile().from;
-  return f || getSmtpUser();
+  f = (f || "").trim();
+  // A veces se pega la clave SMTP en FROM_EMAIL; eso puede disparar errores raros de DNS.
+  if (looksLikeBrevoSecret(f)) f = "";
+  return f || getSmtpLoginOnly() || getSmtpUser();
+}
+
+const BREVO_SMTP_RELAY = "smtp-relay.brevo.com";
+
+function normalizeSmtpHost(raw) {
+  let h = String(raw || "")
+    .replace(/^\uFEFF/, "")
+    .trim();
+  const lower = h.toLowerCase();
+  // Clave API pegada por error como "host" (EBADNAME en DNS)
+  if (lower.includes("xsmtpsib-") || lower.includes("xkeysib-")) {
+    return BREVO_SMTP_RELAY;
+  }
+  if (h && !h.includes(".")) {
+    return BREVO_SMTP_RELAY;
+  }
+  return h || BREVO_SMTP_RELAY;
 }
 
 function getSmtpHost() {
   let h = firstEnv(["SMTP_HOST"]);
   if (!h) h = readSmtpJsonFile().host;
-  return h || "smtp-relay.brevo.com";
+  return normalizeSmtpHost(h);
 }
 
 function getSmtpPort() {
@@ -112,14 +159,34 @@ function getSmtpPort() {
 }
 
 function createTransporter() {
-  const user = getSmtpUser();
-  const pass = getSmtpPass();
-  const host = getSmtpHost();
+  let user = getSmtpUser();
+  let pass = getSmtpPass();
+
+  if (looksLikeBrevoSecret(user) && looksLikeBrevoSecret(pass)) {
+    pass = user === pass ? user : pass;
+    user = getSmtpLoginOnly();
+  } else if (looksLikeBrevoSecret(user)) {
+    pass = brevoPassFromMisassignedUser(user, pass);
+    user = getSmtpLoginOnly();
+  }
+
+  if (looksLikeBrevoSecret(user) && !looksLikeBrevoSecret(pass)) {
+    const tmp = user;
+    user = pass;
+    pass = tmp;
+  }
+
+  const host = normalizeSmtpHost(getSmtpHost());
   const port = getSmtpPort();
 
   if (!user || !pass) {
     throw new Error(
-      "Error SMTP: falta usuario o clave. Abre server.js y rellena SMTP_FALLBACK_USER y SMTP_FALLBACK_PASS (líneas de arriba), guarda, sube a GitHub y despliega."
+      "Error SMTP: falta login o clave. En Brevo el login es …@smtp-brevo.com y la clave es xsmtpsib-… (Render: SMTP_USER + SMTP_PASS, o aquí SMTP_FALLBACK_LOGIN + SMTP_FALLBACK_PASS)."
+    );
+  }
+  if (looksLikeBrevoSecret(user)) {
+    throw new Error(
+      "Error SMTP: el usuario debe ser el login SMTP (ej. a62653001@smtp-brevo.com), no la clave xsmtpsib-."
     );
   }
 
