@@ -286,6 +286,8 @@ app.get("/health", (_req, res) => {
   const envFileOk = fs.existsSync(path.join(__dirname, ".env"));
   res.status(200).json({
     ok: true,
+    /** Si esto no aparece en tu /health, Render no está sirviendo este código (revisa Root Directory y el último deploy). */
+    codeStamp: "pasteleria-smtp-v3-brevo",
     smtpConfigured: hasUser && hasPass,
     hasSmtpLogin: Boolean(getSmtpLoginOnly()),
     hasSmtpUser: hasUser,
