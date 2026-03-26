@@ -1,0 +1,14 @@
+{
+  "name": "pasteleria-mana-pedidos",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Formulario de pedidos con PDF y envio por correo",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "nodemailer": "^6.10.1"
+  }
+}
