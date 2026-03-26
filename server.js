@@ -100,10 +100,25 @@ function readSmtpJsonFile() {
   }
 }
 
+function looksLikeBrevoSmtpLogin(s) {
+  return /@smtp-brevo\.com\s*$/i.test(String(s || "").trim());
+}
+
+/**
+ * Login SMTP (…@smtp-brevo.com). Importante: si SMTP_USER trae por error la clave xsmtpsib,
+ * no nos quedamos ahí: seguimos probando el resto de nombres (muchas guías de Brevo usan otros).
+ * Si el login quedó en SMTP_PASS y la clave en SMTP_USER, también lo detectamos.
+ */
 function getSmtpLoginOnly() {
-  let u = firstEnv(["SMTP_USER", "BREVO_SMTP_LOGIN", "SMTP_LOGIN", "MAIL_USER", "EMAIL_USER"]);
-  if (u && !looksLikeBrevoSecret(u)) return u;
-  u = String(SMTP_FALLBACK_LOGIN || "").trim();
+  const keys = ["BREVO_SMTP_LOGIN", "SMTP_LOGIN", "MAIL_USER", "EMAIL_USER", "SMTP_USER"];
+  for (const k of keys) {
+    const u = envRaw(k);
+    if (u && !looksLikeBrevoSecret(u)) return u;
+  }
+  const passSlot = envRaw("SMTP_PASS");
+  if (passSlot && !looksLikeBrevoSecret(passSlot) && looksLikeBrevoSmtpLogin(passSlot)) return passSlot;
+
+  let u = String(SMTP_FALLBACK_LOGIN || "").trim();
   if (u && !looksLikeBrevoSecret(u)) return u;
   u = String(SMTP_FALLBACK_USER || "").trim();
   if (u && !looksLikeBrevoSecret(u)) return u;
@@ -122,7 +137,7 @@ function getSmtpUser() {
 }
 
 function getSmtpPass() {
-  let p = firstEnv([
+  const passKeys = [
     "SMTP_PASS",
     "SMTP_PASSWORD",
     "BREVO_SMTP_KEY",
@@ -130,8 +145,17 @@ function getSmtpPass() {
     "SMTP_KEY",
     "MAIL_PASSWORD",
     "EMAIL_PASSWORD",
-  ]);
-  if (!p) p = String(SMTP_FALLBACK_PASS || "").trim();
+  ];
+  for (const k of passKeys) {
+    const v = envRaw(k);
+    if (!v) continue;
+    if (!looksLikeBrevoSecret(v) && looksLikeBrevoSmtpLogin(v)) continue;
+    return v;
+  }
+  const maybeKeyInUser = envRaw("SMTP_USER");
+  if (looksLikeBrevoSecret(maybeKeyInUser)) return maybeKeyInUser;
+
+  let p = String(SMTP_FALLBACK_PASS || "").trim();
   if (!p) p = readSmtpJsonFile().pass;
   return p;
 }
