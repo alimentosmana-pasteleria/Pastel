@@ -8,24 +8,63 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: "20mb" }));
 app.use(express.static(__dirname));
 
+/** Render/Brevo a veces nombran distinto las variables; probamos alias comunes. */
+function firstEnv(keys) {
+  for (const k of keys) {
+    const v = process.env[k];
+    if (v != null && String(v).trim() !== "") return String(v).trim();
+  }
+  return "";
+}
+
+function getSmtpUser() {
+  return firstEnv(["SMTP_USER", "BREVO_SMTP_LOGIN", "SMTP_LOGIN", "MAIL_USER", "EMAIL_USER"]);
+}
+
+function getSmtpPass() {
+  return firstEnv([
+    "SMTP_PASS",
+    "SMTP_PASSWORD",
+    "BREVO_SMTP_KEY",
+    "BREVO_SMTP_PASSWORD",
+    "SMTP_KEY",
+  ]);
+}
+
+function getFromEmail() {
+  return firstEnv(["FROM_EMAIL", "MAIL_FROM", "SMTP_FROM"]) || getSmtpUser();
+}
+
 function createTransporter() {
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
+  const user = getSmtpUser();
+  const pass = getSmtpPass();
 
   if (!user || !pass) {
-    throw new Error("Faltan variables SMTP_USER o SMTP_PASS");
+    throw new Error(
+      "Faltan credenciales SMTP. En Render define al menos: SMTP_USER y SMTP_PASS " +
+        "(o alias: BREVO_SMTP_LOGIN + BREVO_SMTP_KEY / SMTP_PASSWORD)."
+    );
   }
 
   return nodemailer.createTransport({
     host: "smtp-relay.brevo.com",
     port: 587,
-    secure: false, // Brevo SMTP relay por lo general usa STARTTLS en 587
+    secure: false,
     auth: { user, pass },
   });
 }
 
 app.get("/health", (_req, res) => {
-  res.status(200).json({ ok: true });
+  const user = getSmtpUser();
+  const pass = getSmtpPass();
+  const hasUser = Boolean(user);
+  const hasPass = Boolean(pass);
+  res.status(200).json({
+    ok: true,
+    smtpConfigured: hasUser && hasPass,
+    hasSmtpUser: hasUser,
+    hasSmtpPass: hasPass,
+  });
 });
 
 async function handleSendOrder(req, res) {
@@ -37,7 +76,7 @@ async function handleSendOrder(req, res) {
     }
 
     const transporter = createTransporter();
-    const fromEmail = process.env.FROM_EMAIL || process.env.SMTP_USER;
+    const fromEmail = getFromEmail();
 
     await transporter.sendMail({
       from: fromEmail,
