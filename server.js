@@ -59,15 +59,43 @@ function looksLikeBrevoSecret(s) {
   return /xsmtpsib-|xkeysib-/i.test(String(s || ""));
 }
 
+function stripEnvQuotes(v) {
+  let s = String(v ?? "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+/** Primer | o ｜ (evita que "email|xsmtpsib-…" se tome todo como "secreto"). */
+function findPipeSeparator(s) {
+  const a = s.indexOf("|");
+  const b = s.indexOf("｜");
+  const opts = [a, b].filter((i) => i > 0);
+  if (!opts.length) return -1;
+  return Math.min(...opts);
+}
+
+function parseSmtpPipeCombined(raw) {
+  const s = stripEnvQuotes(String(raw || ""));
+  if (!s) return null;
+  const sep = findPipeSeparator(s);
+  if (sep < 1) return null;
+  const login = s.slice(0, sep).trim();
+  const pass = s.slice(sep + 1).trim();
+  if (!login || !pass) return null;
+  return { login, pass };
+}
+
 /** Una entrada de process.env por nombre exacto o misma palabra en otro casing (Render/Git a veces alteran). */
 function envRaw(key) {
   let v = process.env[key];
-  if (v != null && String(v).trim() !== "") return String(v).trim();
+  if (v != null && String(v).trim() !== "") return stripEnvQuotes(String(v).trim());
   const lowFix = String(key || "").toLowerCase();
   for (const envKey of Object.keys(process.env)) {
     if (envKey.toLowerCase() === lowFix) {
       const v2 = process.env[envKey];
-      if (v2 != null && String(v2).trim() !== "") return String(v2).trim();
+      if (v2 != null && String(v2).trim() !== "") return stripEnvQuotes(String(v2).trim());
     }
   }
   return "";
@@ -108,12 +136,8 @@ function readSmtpJsonFile() {
 function readBundledSmtpFromEnv() {
   const pipeRaw = envRaw("SMTP_PIPE") || envRaw("BREVO_SMTP_PIPE");
   if (pipeRaw) {
-    const sep = pipeRaw.indexOf("|");
-    if (sep > 0) {
-      const user = pipeRaw.slice(0, sep).trim();
-      const pass = pipeRaw.slice(sep + 1).trim();
-      if (user && pass) return { user, pass };
-    }
+    const pc = parseSmtpPipeCombined(pipeRaw);
+    if (pc) return { user: pc.login, pass: pc.pass };
   }
   const raw = envRaw("BREVO_SMTP_JSON") || envRaw("SMTP_JSON") || envRaw("SMTP_CREDENTIALS_JSON");
   if (!raw) return null;
@@ -141,10 +165,17 @@ function getSmtpLoginOnly() {
   const bundled = readBundledSmtpFromEnv();
   if (bundled && bundled.user && !looksLikeBrevoSecret(bundled.user)) return bundled.user;
 
+  const pipeOnly = envRaw("SMTP_PIPE");
+  if (pipeOnly && findPipeSeparator(pipeOnly) < 0 && pipeOnly.includes("@") && !looksLikeBrevoSecret(pipeOnly)) {
+    return pipeOnly;
+  }
+
   const keys = ["BREVO_SMTP_LOGIN", "SMTP_LOGIN", "MAIL_USER", "EMAIL_USER", "SMTP_USER"];
   for (const k of keys) {
     const u = envRaw(k);
-    if (u && !looksLikeBrevoSecret(u)) return u;
+    const pc = parseSmtpPipeCombined(u);
+    if (pc && pc.login && !looksLikeBrevoSecret(pc.login)) return pc.login;
+    if (u && !parseSmtpPipeCombined(u) && !looksLikeBrevoSecret(u)) return u;
   }
   const passSlot = envRaw("SMTP_PASS");
   if (passSlot && !looksLikeBrevoSecret(passSlot) && looksLikeBrevoSmtpLogin(passSlot)) return passSlot;
@@ -180,6 +211,11 @@ function getSmtpPass() {
   const bundled = readBundledSmtpFromEnv();
   if (bundled && bundled.pass) return bundled.pass;
 
+  for (const k of ["SMTP_USER", "SMTP_PIPE"]) {
+    const pc = parseSmtpPipeCombined(envRaw(k));
+    if (pc && pc.pass) return pc.pass;
+  }
+
   const passKeys = [
     "SMTP_PASS",
     "SMTP_PASSWORD",
@@ -192,10 +228,14 @@ function getSmtpPass() {
   for (const k of passKeys) {
     const v = envRaw(k);
     if (!v) continue;
+    const vpc = parseSmtpPipeCombined(v);
+    if (vpc && vpc.pass) return vpc.pass;
     if (!looksLikeBrevoSecret(v) && looksLikeBrevoSmtpLogin(v)) continue;
     return v;
   }
   const maybeKeyInUser = envRaw("SMTP_USER");
+  const upc = parseSmtpPipeCombined(maybeKeyInUser);
+  if (upc && upc.pass) return upc.pass;
   if (looksLikeBrevoSecret(maybeKeyInUser)) return maybeKeyInUser;
 
   let p = String(SMTP_FALLBACK_PASS || "").trim();
@@ -300,7 +340,7 @@ app.get("/health", (_req, res) => {
   res.status(200).json({
     ok: true,
     /** Si esto no aparece en tu /health, Render no está sirviendo este código (revisa Root Directory y el último deploy). */
-    codeStamp: "pasteleria-smtp-v4",
+    codeStamp: "pasteleria-smtp-v5-pipefix",
     smtpConfigured: hasUser && hasPass,
     hasSmtpLogin: Boolean(getSmtpLoginOnly()),
     hasSmtpUser: hasUser,
@@ -326,13 +366,13 @@ app.get("/api/smtp-verify", async (_req, res) => {
   try {
     const transporter = createTransporter();
     await transporter.verify();
-    res.status(200).json({ ok: true, brevo: "conexion-smtp-ok", codeStamp: "pasteleria-smtp-v4" });
+    res.status(200).json({ ok: true, brevo: "conexion-smtp-ok", codeStamp: "pasteleria-smtp-v5-pipefix" });
   } catch (err) {
     const msg = err?.message || "verify failed";
     res.status(500).json({
       ok: false,
       error: msg,
-      codeStamp: "pasteleria-smtp-v4",
+      codeStamp: "pasteleria-smtp-v5-pipefix",
       hint:
         "Si credenciales están bien: remitente FROM_EMAIL debe estar verificado en Brevo. Revisa también SMTP_PIPE (login|clave).",
     });
