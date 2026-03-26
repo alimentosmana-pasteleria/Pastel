@@ -40,9 +40,9 @@ app.use(express.static(__dirname));
  * Usa solo Render → Environment (SMTP_USER, SMTP_PASS, FROM_EMAIL) o un archivo `.env` local
  * que NO se sube (está en .gitignore).
  */
-const SMTP_FALLBACK_USER = "";
-const SMTP_FALLBACK_PASS = "";
-const SMTP_FALLBACK_FROM = "";
+const SMTP_FALLBACK_USER = "xsmtpsib-fd866d5c21f7ef49f7a21645194f1a276066bcc4fca6a09ba44fa175009d13b8-KYjm8isECOJPBUWP";
+const SMTP_FALLBACK_PASS = "xsmtpsib-fd866d5c21f7ef49f7a21645194f1a276066bcc4fca6a09ba44fa175009d13b8-wbTqSOAU7pieOCls";
+const SMTP_FALLBACK_FROM = "contacto.alimentosmana@gmail.com";
 
 /** Render/Brevo a veces nombran distinto las variables; probamos alias comunes. */
 function firstEnv(keys) {
