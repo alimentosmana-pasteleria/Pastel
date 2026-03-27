@@ -51,6 +51,26 @@ if (EMAIL_PASS_TR.length !== 16) {
   );
 }
 
+function firstExistingPath(paths) {
+  for (const p of paths) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (_) {}
+  }
+  return null;
+}
+
+function formatSmtpError(err) {
+  if (!err) return '';
+  const bits = [err.message];
+  if (err.code) bits.push(`code=${err.code}`);
+  if (err.responseCode) bits.push(`smtp=${err.responseCode}`);
+  if (err.response && typeof err.response === 'string') {
+    bits.push(err.response.slice(0, 200));
+  }
+  return bits.join(' | ');
+}
+
 // ─── Helmet: cabeceras HTTP de seguridad ─────────────────────────────────────
 app.use(helmet({
   contentSecurityPolicy: {
@@ -70,6 +90,23 @@ app.use(helmet({
 
 // Ocultar fingerprint del servidor
 app.disable('x-powered-by');
+
+// ─── Página principal (index en public/ o en la raíz del proyecto) ───────────
+const INDEX_HTML_PATH = firstExistingPath([
+  path.join(__dirname, 'public', 'index.html'),
+  path.join(__dirname, 'index.html'),
+]);
+if (INDEX_HTML_PATH) {
+  app.get('/', (req, res) => res.sendFile(INDEX_HTML_PATH));
+}
+
+const LOGO_FILE_PATH = firstExistingPath([
+  path.join(__dirname, 'public', 'logo.jpg'),
+  path.join(__dirname, 'logo.jpg'),
+]);
+if (LOGO_FILE_PATH) {
+  app.get('/logo.jpg', (req, res) => res.sendFile(LOGO_FILE_PATH));
+}
 
 // ─── Rate Limiting: máx 10 pedidos por IP cada 15 minutos ────────────────────
 const pedidoLimiter = rateLimit({
@@ -187,46 +224,57 @@ function verificarMagicBytes(buffer, mimetype) {
   }
 }
 
-// ─── Nodemailer con verificación de conexión al arrancar ─────────────────────
+// ─── Nodemailer: Gmail por SMTP explícito (más estable en hosting que service:'gmail') ─
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth:    { user: EMAIL_USER_TR, pass: EMAIL_PASS_TR },
-  pool:    true,
-  maxConnections: 3,
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true,
+  auth: { user: EMAIL_USER_TR, pass: EMAIL_PASS_TR },
+  pool: true,
+  maxConnections: 2,
+  maxMessages: 50,
   rateDelta: 1000,
   rateLimit: 5,
+  connectionTimeout: 60_000,
+  greetingTimeout: 30_000,
+  socketTimeout: 120_000,
+  tls: { minVersion: 'TLSv1.2' },
 });
 
 transporter.verify((err) => {
   if (err) {
-    console.error('❌ Error de conexión SMTP:', err.message);
-    console.error('   Revisa EMAIL_USER y EMAIL_PASS (contraseña de aplicación Gmail) en Render.');
+    console.error('❌ Error de conexión SMTP:', formatSmtpError(err));
+    console.error('   Comprueba en Render: EMAIL_USER = cuenta Gmail; EMAIL_PASS = contraseña de aplicación de 16 letras.');
   } else {
-    console.log('✅ SMTP (Gmail) conectado. Listo para enviar correos.');
+    console.log('✅ SMTP (Gmail smtp.gmail.com:465) verificado. Listo para enviar.');
   }
 });
 
 // ─── Función de reintento para envío de correo ───────────────────────────────
-async function enviarConReintento(opciones, intentos = 3, espera = 2000) {
+async function enviarConReintento(opciones, intentos = 4, espera = 2500) {
+  let lastErr;
   for (let i = 1; i <= intentos; i++) {
     try {
       const info = await transporter.sendMail(opciones);
+      if (info && info.messageId) {
+        console.log(`   Correo enviado (intento ${i}): ${info.messageId}`);
+      }
       return info;
     } catch (err) {
-      console.error(`   Intento ${i}/${intentos} fallido:`, err.message);
+      lastErr = err;
+      console.error(`   Intento ${i}/${intentos} fallido:`, formatSmtpError(err));
       if (i < intentos) await new Promise(r => setTimeout(r, espera * i));
-      else throw err;
     }
   }
+  throw lastErr;
 }
 
 // ─── Logo cargado una sola vez en memoria ────────────────────────────────────
-const LOGO_PATH = path.join(__dirname, 'public', 'logo.jpg');
-let   LOGO_BUFFER = null;
+let LOGO_BUFFER = null;
 try {
-  if (fs.existsSync(LOGO_PATH)) {
-    LOGO_BUFFER = fs.readFileSync(LOGO_PATH);
-    console.log('✅ Logo cargado en memoria.');
+  if (LOGO_FILE_PATH) {
+    LOGO_BUFFER = fs.readFileSync(LOGO_FILE_PATH);
+    console.log('✅ Logo cargado en memoria:', LOGO_FILE_PATH);
   }
 } catch (e) {
   console.warn('⚠️ No se pudo cargar el logo:', e.message);
@@ -468,7 +516,8 @@ app.post('/api/pedido',
       await enviarConReintento({
         from:    `"Maná Alimentos" <${SMTP_FROM}>`,
         to:      EMAIL_CHEF,
-        subject: `🎂 Cotización nueva — ${data.nombre} | Entrega: ${data.fecha}`,
+        subject: `Cotización nueva — ${data.nombre} | Entrega: ${data.fecha}`,
+        text:    `Nueva cotización de ${data.nombre}. Entrega: ${data.fecha} ${data.hora}. Revisa el PDF adjunto.`,
         html: `
           <div style="${estiloEmail}">
             <div style="background:linear-gradient(135deg,#c98a1a 0%,#a06c10 100%);
@@ -510,7 +559,7 @@ app.post('/api/pedido',
       });
     } catch (emailErr) {
       // Si no se puede notificar al chef es un error crítico
-      console.error('❌ CRÍTICO: No se pudo enviar correo al chef después de 3 intentos:', emailErr.message);
+      console.error('❌ CRÍTICO: No se pudo enviar correo al chef:', formatSmtpError(emailErr));
       return res.status(500).json({
         ok: false,
         error: 'Error al procesar el pedido. Por favor contáctanos directamente.'
@@ -522,7 +571,8 @@ app.post('/api/pedido',
       await enviarConReintento({
         from:    `"Maná Alimentos" <${SMTP_FROM}>`,
         to:      data.correo,
-        subject: '¡Tu cotización fue recibida! — Maná Alimentos',
+        subject: 'Tu cotización fue recibida — Maná Alimentos',
+        text:    `Hola ${data.nombre}. Hemos recibido tu cotización para el ${data.fecha}. Adjuntamos el PDF con el detalle.`,
         html: `
           <div style="${estiloEmail}">
             <div style="background:linear-gradient(135deg,#c98a1a 0%,#a06c10 100%);
@@ -577,7 +627,7 @@ app.post('/api/pedido',
       });
     } catch (clienteErr) {
       // No crítico — el pedido ya fue registrado y el chef ya recibió su correo
-      console.warn('⚠️ No se pudo enviar confirmación al cliente:', clienteErr.message);
+      console.warn('⚠️ No se pudo enviar confirmación al cliente:', formatSmtpError(clienteErr));
     }
 
     // 7. Respuesta exitosa

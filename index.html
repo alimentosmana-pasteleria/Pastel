@@ -430,18 +430,26 @@
     const btnText = document.getElementById('btnText');
     btn.disabled = true; spinner.style.display = 'block'; btnText.textContent = 'Enviando...';
     try {
-      const res  = await fetch('/api/pedido', { method: 'POST', body: new FormData(this) });
-      const data = await res.json();
-      if (data.ok) {
+      const res = await fetch('/api/pedido', { method: 'POST', body: new FormData(this) });
+      const raw = await res.text();
+      let data = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        alert('El servidor respondió de forma inesperada (' + res.status + '). Revisa el sitio o intenta más tarde.');
+        btn.disabled = false; spinner.style.display = 'none'; btnText.textContent = 'Enviar pedido';
+        return;
+      }
+      if (res.ok && data.ok) {
         this.style.display = 'none';
         document.getElementById('success-msg').style.display = 'block';
         window.scrollTo({ top: 0, behavior: 'smooth' });
       } else {
-        alert('Error: ' + (data.error || 'intenta de nuevo'));
+        alert('Error: ' + (data.error || 'Código ' + res.status + '. Intenta de nuevo o contáctanos por WhatsApp.'));
         btn.disabled = false; spinner.style.display = 'none'; btnText.textContent = 'Enviar pedido';
       }
-    } catch {
-      alert('Error de conexión. Intenta de nuevo.');
+    } catch (err) {
+      alert('Error de conexión. Comprueba tu internet e intenta de nuevo.');
       btn.disabled = false; spinner.style.display = 'none'; btnText.textContent = 'Enviar pedido';
     }
   });
