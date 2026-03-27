@@ -1,4 +1,3 @@
-# Credenciales: nunca subir a GitHub
-.env
-smtp.json
 node_modules/
+.env
+*.log

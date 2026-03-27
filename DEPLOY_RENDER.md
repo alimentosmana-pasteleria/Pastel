@@ -1,73 +1,74 @@
-# Publicar en Render (paso a paso)
+# 🚀 Deploy en Render — Guía paso a paso
 
-Esta guía y el `server.js` actual usan **las mismas variables**: lo que pongas en Render es lo que lee el servidor.
+## 1. Prepara tu repositorio en GitHub
 
-## 1) Subir proyecto a GitHub
+```bash
+git init
+git add .
+git commit -m "Pasteleria: sistema de pedidos con PDF y correo"
+git branch -M main
+git remote add origin https://github.com/TU_USUARIO/pasteleria-pedidos.git
+git push -u origin main
+```
 
-1. Crea un repositorio (o usa el que ya tienes).
-2. Sube: `index.html`, `server.js`, `package.json`, `package-lock.json`, y si usas la opción B del paso 4, también **`.env`** (y deja **`.env.example`** como plantilla).
+## 2. Crea el servicio en Render
 
-## 2) Brevo (correo SMTP)
-
-1. Cuenta en Brevo: <https://www.brevo.com/>
-2. Ve a **SMTP & API** y crea credenciales SMTP.
-3. Anota estos datos (son los que vas a copiar a Render):
-
-   - `SMTP_HOST` → normalmente `smtp-relay.brevo.com`
-   - `SMTP_PORT` → `587`
-   - `SMTP_USER`
-   - `SMTP_PASS`
-4. Define un correo remitente válido para **`FROM_EMAIL`** (verificado en Brevo).
-
-## 3) Crear servicio en Render
-
-1. Entra a <https://render.com/>
-2. **New +** → **Web Service**
-3. Conecta tu repositorio de GitHub.
+1. Ve a **https://render.com** y crea una cuenta (gratis)
+2. Click en **"New +"** → **"Web Service"**
+3. Conecta tu repositorio de GitHub
 4. Configura:
+   - **Name:** pasteleria-pedidos
+   - **Runtime:** Node
+   - **Build Command:** `npm install`
+   - **Start Command:** `npm start`
+   - **Plan:** Free
 
-   - **Runtime**: Node  
-   - **Build Command**: `npm install`  
-   - **Start Command**: `npm start**
+## 3. Variables de entorno en Render
 
-## 4) Credenciales SMTP (elige una forma)
+En tu servicio → **"Environment"** → agrega:
 
-### A) Solo Render (Environment Variables)
+| Variable      | Valor                          |
+|---------------|-------------------------------|
+| EMAIL_USER    | tupasteleria@gmail.com         |
+| EMAIL_PASS    | tu contraseña de aplicación   |
+| EMAIL_CHEF    | chef@tupasteleria.com          |
 
-En **Environment** agrega (Key exacto, Value sin comillas):
+### ¿Cómo obtener la contraseña de aplicación de Gmail?
+1. Ve a tu cuenta Google → Seguridad
+2. Activa **Verificación en 2 pasos** (si no la tienes)
+3. Busca **"Contraseñas de aplicaciones"**
+4. Genera una para "Correo / Otro dispositivo"
+5. Copia las 16 letras → esa es tu EMAIL_PASS
 
-| Key | Value (ejemplo Brevo) |
-|-----|------------------------|
-| `SMTP_HOST` | `smtp-relay.brevo.com` |
-| `SMTP_PORT` | `587` |
-| `SMTP_USER` | Tu login SMTP de Brevo |
-| `SMTP_PASS` | Tu clave SMTP de Brevo |
-| `FROM_EMAIL` | Tu correo remitente verificado |
+## 4. Listo 🎉
 
-### B) Archivo `.env` en el proyecto (si Render no te “pasa” las variables al servidor)
+Tu URL será: `https://pasteleria-pedidos.onrender.com`
 
-1. Copia `.env.example` → `.env`.
-2. Abre `.env` y rellena `SMTP_USER`, `SMTP_PASS`, `FROM_EMAIL`.
-3. Sube **`.env`** a GitHub con el resto del proyecto y vuelve a desplegar.
+Comparte ese link o genera un QR con:
+- https://qrcode-monkey.com
+- https://www.qr-code-generator.com
 
-El `server.js` lee `.env` al arrancar y rellena lo que falte en `process.env`.
+## Estructura del proyecto
 
-> Si el repo es público, un `.env` con claves es un riesgo; usa repo privado o solo variables en Render.
+```
+pasteleria-pedidos/
+├── public/
+│   └── index.html      ← formulario del cliente
+├── server.js           ← backend Node.js
+├── package.json
+├── .gitignore
+├── .env.example        ← referencia de variables
+└── DEPLOY_RENDER.md    ← esta guía
+```
 
-### C) Otras opciones
+## Cómo funciona el flujo
 
-- `smtp.json` (ver `smtp.example.json`), o constantes `SMTP_FALLBACK_*` al inicio de `server.js`.
-
-## 5) Deploy
-
-1. **Create Web Service** (o guarda cambios).
-2. Espera el deploy.
-3. Abre la URL de Render.
-
-## 6) Probar
-
-1. Llena el formulario.
-2. Pulsa **Concretar Pedido**.
-3. Debe llegarte el correo con el PDF adjunto.
-
-El envío va por `POST /api/send-order` (SMTP con Nodemailer).
+1. Cliente escanea QR → llega a la página
+2. Llena el formulario (con imagen opcional)
+3. Presiona "Enviar pedido"
+4. El servidor:
+   a. Recibe todos los datos + imagen
+   b. Genera un PDF con PDFKit (incluye imagen)
+   c. Envía email al CHEF con PDF + imagen adjuntos
+   d. Envía email de confirmación al CLIENTE con su PDF
+5. La página muestra pantalla de éxito

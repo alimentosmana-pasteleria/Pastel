@@ -1,502 +1,587 @@
-const express = require("express");
-const nodemailer = require("nodemailer");
-const path = require("path");
-const fs = require("fs");
+'use strict';
 
-/**
- * Si Render no inyecta variables, puedes subir un archivo `.env` en la raíz
- * (copia `.env.example` → `.env` y rellena). Solo rellena claves vacías en process.env.
- */
-function loadEnvFile() {
-  const fp = path.join(__dirname, ".env");
-  if (!fs.existsSync(fp)) return;
-  const text = fs.readFileSync(fp, "utf8");
-  for (let line of text.split(/\r?\n/)) {
-    line = line.trim();
-    if (!line || line.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq < 1) continue;
-    const key = line.slice(0, eq).trim();
-    let val = line.slice(eq + 1).trim();
-    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-      val = val.slice(1, -1);
-    }
-    const cur = process.env[key];
-    if (cur == null || String(cur).trim() === "") {
-      process.env[key] = val;
-    }
-  }
-}
-loadEnvFile();
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Maná Alimentos — Servidor de Pedidos
+//  Versión: segura y robusta
+//  Protecciones: Helmet, Rate Limit, Validación, Sanitización XSS,
+//                Verificación MIME real, Timeout en PDF, Retry en email
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// #region agent log
-const AGENT_DEBUG_LOG = path.join(__dirname, "debug-cfd408.log");
-function agentDebugLog(payload) {
-  const line = JSON.stringify({
-    sessionId: "cfd408",
-    timestamp: Date.now(),
-    ...payload,
-  });
-  try {
-    fs.appendFileSync(AGENT_DEBUG_LOG, line + "\n");
-  } catch (_) {}
-  console.log("[DEBUG_CFD408]", line);
-}
-// #endregion
+const express      = require('express');
+const multer       = require('multer');
+const nodemailer   = require('nodemailer');
+const PDFDocument  = require('pdfkit');
+const helmet       = require('helmet');
+const rateLimit    = require('express-rate-limit');
+const path         = require('path');
+const fs           = require('fs');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// Permite que el formulario llame al API desde otro origen si CONFIG.apiBaseUrl apunta a este servidor.
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
+// ─── Verificar variables de entorno al arrancar ───────────────────────────────
+const REQUIRED_ENV = ['EMAIL_USER', 'EMAIL_PASS'];
+REQUIRED_ENV.forEach(key => {
+  if (!process.env[key]) {
+    console.error(`❌ FATAL: Variable de entorno ${key} no definida. El servidor no puede arrancar.`);
+    process.exit(1);
+  }
+});
+const EMAIL_CHEF = process.env.EMAIL_CHEF || process.env.EMAIL_USER;
+
+// ─── Helmet: cabeceras HTTP de seguridad ─────────────────────────────────────
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc:  ["'self'"],
+      scriptSrc:   ["'self'", "'unsafe-inline'"],   // necesario para el JS inline del form
+      styleSrc:    ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      fontSrc:     ["'self'", 'https://fonts.gstatic.com'],
+      imgSrc:      ["'self'", 'data:'],
+      connectSrc:  ["'self'"],
+      objectSrc:   ["'none'"],
+      frameAncestors: ["'none'"],
+    }
+  },
+  crossOriginEmbedderPolicy: false,
+}));
+
+// Ocultar fingerprint del servidor
+app.disable('x-powered-by');
+
+// ─── Rate Limiting: máx 10 pedidos por IP cada 15 minutos ────────────────────
+const pedidoLimiter = rateLimit({
+  windowMs:  15 * 60 * 1000,  // 15 minutos
+  max:       10,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: { ok: false, error: 'Demasiadas solicitudes. Intenta en unos minutos.' },
+  skip: (req) => req.method !== 'POST',   // solo limita POST
 });
 
-app.use(express.json({ limit: "20mb" }));
-app.use(express.static(__dirname));
+// ─── Multer: imagen en memoria, validación estricta ──────────────────────────
+const ALLOWED_MIME  = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+const MAX_FILE_SIZE = 5 * 1024 * 1024;  // 5 MB
 
-/**
- * Render: preferible SMTP_USER + SMTP_PASS en Environment.
- * Local / sin env: LOGIN = solo tu usuario SMTP Brevo (…@smtp-brevo.com); PASS = solo xsmtpsib-…
- * No pongas la clave xsmtpsib en LOGIN (si las dos constantes son la clave, falla hasta corregir).
- */
-const SMTP_FALLBACK_LOGIN = "";
-const SMTP_FALLBACK_PASS = "";
-/** @deprecated usar SMTP_FALLBACK_LOGIN + SMTP_FALLBACK_PASS; si rellenas esto, debe ser el login, no la clave */
-const SMTP_FALLBACK_USER = "";
-const SMTP_FALLBACK_FROM = "contacto.alimentosmana@gmail.com";
-
-function looksLikeBrevoSecret(s) {
-  return /xsmtpsib-|xkeysib-/i.test(String(s || ""));
-}
-
-function stripEnvQuotes(v) {
-  let s = String(v ?? "").trim();
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    s = s.slice(1, -1).trim();
-  }
-  return s;
-}
-
-/** Primer | o ｜ (evita que "email|xsmtpsib-…" se tome todo como "secreto"). */
-function findPipeSeparator(s) {
-  const a = s.indexOf("|");
-  const b = s.indexOf("｜");
-  const opts = [a, b].filter((i) => i > 0);
-  if (!opts.length) return -1;
-  return Math.min(...opts);
-}
-
-function parseSmtpPipeCombined(raw) {
-  const s = stripEnvQuotes(String(raw || ""));
-  if (!s) return null;
-  const sep = findPipeSeparator(s);
-  if (sep < 1) return null;
-  const login = s.slice(0, sep).trim();
-  const pass = s.slice(sep + 1).trim();
-  if (!login || !pass) return null;
-  return { login, pass };
-}
-
-/** Una entrada de process.env por nombre exacto o misma palabra en otro casing (Render/Git a veces alteran). */
-function envRaw(key) {
-  let v = process.env[key];
-  if (v != null && String(v).trim() !== "") return stripEnvQuotes(String(v).trim());
-  const lowFix = String(key || "").toLowerCase();
-  for (const envKey of Object.keys(process.env)) {
-    if (envKey.toLowerCase() === lowFix) {
-      const v2 = process.env[envKey];
-      if (v2 != null && String(v2).trim() !== "") return stripEnvQuotes(String(v2).trim());
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: MAX_FILE_SIZE, files: 1 },
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_MIME.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', 'Tipo de archivo no permitido. Solo JPG, PNG, WEBP.'));
     }
   }
-  return "";
+});
+
+// ─── Archivos estáticos ───────────────────────────────────────────────────────
+app.use(express.static(path.join(__dirname, 'public'), {
+  etag:         true,
+  maxAge:       '1d',
+  setHeaders:   (res) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+  }
+}));
+
+// ─── Sanitizador XSS simple (sin dependencias extra) ─────────────────────────
+function sanitize(str) {
+  if (typeof str !== 'string') return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;')
+    .replace(/\//g, '&#x2F;')
+    .trim()
+    .slice(0, 500);  // límite máximo por campo
 }
 
-/** Render/Brevo a veces nombran distinto las variables; probamos alias comunes. */
-function firstEnv(keys) {
-  for (const k of keys) {
-    const v = envRaw(k);
-    if (v !== "") return v;
+// ─── Validador de campos del formulario ──────────────────────────────────────
+const CAMPOS_REQUERIDOS = ['nombre', 'telefono', 'correo', 'direccion', 'fecha', 'hora', 'tamano', 'saborBizcocho', 'relleno', 'cobertura', 'tipoDiseno'];
+const TAMANOS_VALIDOS   = ['Pequeño (8-10 piezas)', 'Mediano (12-15 piezas)', 'Grande (18-20 piezas)', 'Extra Grande (25+ piezas)'];
+const DISENOS_VALIDOS   = ['Chef decide', 'Personalizado'];
+const SABORES_VALIDOS   = ['Vainilla', 'Chocolate', 'Red Velvet', 'Limón', 'Zanahoria', 'Mármol (vainilla + chocolate)', 'Otro'];
+const RELLENOS_VALIDOS  = ['Crema pastelera', 'Buttercream de vainilla', 'Ganache de chocolate', 'Mermelada de fresa', 'Dulce de leche', 'Nutella', 'Otro'];
+const COBERTURAS_VALIDAS= ['Buttercream liso', 'Fondant', 'Ganache', 'Semi naked cake', 'Crema chantilly', 'Otro'];
+const COLORES_VALIDOS   = ['Blanco', 'Rosa', 'Dorado', 'Negro', 'Azul', 'Verde', 'Morado', 'Otro'];
+const REGEX_EMAIL       = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const REGEX_FECHA       = /^\d{4}-\d{2}-\d{2}$/;
+const REGEX_HORA        = /^\d{2}:\d{2}$/;
+const REGEX_TEL         = /^[\d\s\+\-\(\)]{6,20}$/;
+
+function validarPedido(body) {
+  const errores = [];
+
+  // Campos requeridos
+  for (const campo of CAMPOS_REQUERIDOS) {
+    if (!body[campo] || String(body[campo]).trim() === '') {
+      errores.push(`Campo requerido: ${campo}`);
+    }
   }
-  return "";
+  if (errores.length) return errores;
+
+  // Formato email
+  if (!REGEX_EMAIL.test(body.correo))    errores.push('Correo inválido');
+  // Formato fecha
+  if (!REGEX_FECHA.test(body.fecha))     errores.push('Fecha inválida');
+  // Fecha no en el pasado
+  const fechaPedido = new Date(body.fecha + 'T00:00:00');
+  const hoy = new Date(); hoy.setHours(0,0,0,0);
+  if (fechaPedido < hoy)                 errores.push('La fecha no puede ser en el pasado');
+  // Formato hora
+  if (!REGEX_HORA.test(body.hora))       errores.push('Hora inválida');
+  // Teléfono
+  if (!REGEX_TEL.test(body.telefono))    errores.push('Teléfono inválido');
+
+  // Enumeraciones (previene inyección de valores inventados)
+  if (!TAMANOS_VALIDOS.includes(body.tamano))           errores.push('Tamaño inválido');
+  if (!DISENOS_VALIDOS.includes(body.tipoDiseno))       errores.push('Tipo de diseño inválido');
+  if (!SABORES_VALIDOS.includes(body.saborBizcocho))    errores.push('Sabor de bizcocho inválido');
+  if (!RELLENOS_VALIDOS.includes(body.relleno))         errores.push('Relleno inválido');
+  if (!COBERTURAS_VALIDAS.includes(body.cobertura))     errores.push('Cobertura inválida');
+
+  // Colores (array opcional)
+  if (body.colores) {
+    const colores = Array.isArray(body.colores) ? body.colores : [body.colores];
+    const invalidos = colores.filter(c => !COLORES_VALIDOS.includes(c));
+    if (invalidos.length) errores.push('Colores inválidos: ' + invalidos.join(', '));
+  }
+
+  return errores;
 }
 
-function readSmtpJsonFile() {
-  try {
-    const fp = path.join(__dirname, "smtp.json");
-    if (!fs.existsSync(fp)) return { user: "", pass: "", from: "", host: "", port: "" };
-    const j = JSON.parse(fs.readFileSync(fp, "utf8"));
-    return {
-      user: String(j.user || j.login || "").trim(),
-      pass: String(j.pass || j.password || j.key || "").trim(),
-      from: String(j.from || "").trim(),
-      host: String(j.host || "").trim(),
-      port: String(j.port || "").trim(),
-    };
-  } catch (e) {
-    console.error("smtp.json:", e.message);
-    return { user: "", pass: "", from: "", host: "", port: "" };
+// ─── Verificación de magic bytes (firma real del archivo) ─────────────────────
+function verificarMagicBytes(buffer, mimetype) {
+  if (!buffer || buffer.length < 4) return false;
+  const bytes = buffer.slice(0, 4);
+  switch (mimetype) {
+    case 'image/jpeg': return bytes[0] === 0xFF && bytes[1] === 0xD8;
+    case 'image/png':  return bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47;
+    case 'image/webp': return buffer.slice(0,4).toString('ascii') === 'RIFF' && buffer.slice(8,12).toString('ascii') === 'WEBP';
+    case 'image/gif':  return bytes.slice(0,3).toString('ascii') === 'GIF';
+    default: return false;
   }
 }
 
-/**
- * Credenciales en una sola variable Render (elige UNA opción):
- * - SMTP_PIPE = login@smtp-brevo.com|xsmtpsib-... (un solo | entre login y clave; más fácil que JSON)
- * - BREVO_SMTP_JSON = {"user":"…","pass":"…"}
- */
-function readBundledSmtpFromEnv() {
-  const pipeRaw = envRaw("SMTP_PIPE") || envRaw("BREVO_SMTP_PIPE");
-  if (pipeRaw) {
-    const pc = parseSmtpPipeCombined(pipeRaw);
-    if (pc) return { user: pc.login, pass: pc.pass };
+// ─── Nodemailer con verificación de conexión al arrancar ─────────────────────
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+  pool: true,             // reutiliza conexiones
+  maxConnections: 3,
+  rateDelta: 1000,
+  rateLimit: 5,
+});
+
+transporter.verify((err) => {
+  if (err) {
+    console.error('❌ Error de conexión SMTP:', err.message);
+    console.error('   Verifica EMAIL_USER y EMAIL_PASS en las variables de entorno.');
+  } else {
+    console.log('✅ SMTP conectado correctamente. Listo para enviar correos.');
   }
-  const raw = envRaw("BREVO_SMTP_JSON") || envRaw("SMTP_JSON") || envRaw("SMTP_CREDENTIALS_JSON");
-  if (!raw) return null;
-  try {
-    const j = JSON.parse(raw);
-    return {
-      user: String(j.user || j.login || "").trim(),
-      pass: String(j.pass || j.password || j.key || "").trim(),
-    };
-  } catch {
-    return null;
+});
+
+// ─── Función de reintento para envío de correo ───────────────────────────────
+async function enviarConReintento(opciones, intentos = 3, espera = 2000) {
+  for (let i = 1; i <= intentos; i++) {
+    try {
+      const info = await transporter.sendMail(opciones);
+      return info;
+    } catch (err) {
+      console.error(`   Intento ${i}/${intentos} fallido:`, err.message);
+      if (i < intentos) await new Promise(r => setTimeout(r, espera * i));
+      else throw err;
+    }
   }
 }
 
-function looksLikeBrevoSmtpLogin(s) {
-  return /@smtp-brevo\.com\s*$/i.test(String(s || "").trim());
+// ─── Logo cargado una sola vez en memoria ────────────────────────────────────
+const LOGO_PATH = path.join(__dirname, 'public', 'logo.jpg');
+let   LOGO_BUFFER = null;
+try {
+  if (fs.existsSync(LOGO_PATH)) {
+    LOGO_BUFFER = fs.readFileSync(LOGO_PATH);
+    console.log('✅ Logo cargado en memoria.');
+  }
+} catch (e) {
+  console.warn('⚠️ No se pudo cargar el logo:', e.message);
 }
 
-/**
- * Login SMTP (…@smtp-brevo.com). Importante: si SMTP_USER trae por error la clave xsmtpsib,
- * no nos quedamos ahí: seguimos probando el resto de nombres (muchas guías de Brevo usan otros).
- * Si el login quedó en SMTP_PASS y la clave en SMTP_USER, también lo detectamos.
- */
-function getSmtpLoginOnly() {
-  const bundled = readBundledSmtpFromEnv();
-  if (bundled && bundled.user && !looksLikeBrevoSecret(bundled.user)) return bundled.user;
+// ─── Generador de PDF ─────────────────────────────────────────────────────────
+function generarPDF(data, imagenBuffer) {
+  return new Promise((resolve, reject) => {
 
-  const pipeOnly = envRaw("SMTP_PIPE");
-  if (pipeOnly && findPipeSeparator(pipeOnly) < 0 && pipeOnly.includes("@") && !looksLikeBrevoSecret(pipeOnly)) {
-    return pipeOnly;
-  }
+    // Timeout de seguridad: si el PDF tarda >15s, rechazar
+    const timeout = setTimeout(() => reject(new Error('Timeout generando PDF')), 15000);
 
-  const keys = ["BREVO_SMTP_LOGIN", "SMTP_LOGIN", "MAIL_USER", "EMAIL_USER", "SMTP_USER"];
-  for (const k of keys) {
-    const u = envRaw(k);
-    const pc = parseSmtpPipeCombined(u);
-    if (pc && pc.login && !looksLikeBrevoSecret(pc.login)) return pc.login;
-    if (u && !parseSmtpPipeCombined(u) && !looksLikeBrevoSecret(u)) return u;
-  }
-  const passSlot = envRaw("SMTP_PASS");
-  if (passSlot && !looksLikeBrevoSecret(passSlot) && looksLikeBrevoSmtpLogin(passSlot)) return passSlot;
+    const doc    = new PDFDocument({ size: 'A4', margin: 50, bufferPages: true });
+    const chunks = [];
+    doc.on('data',  c  => chunks.push(c));
+    doc.on('end',   () => { clearTimeout(timeout); resolve(Buffer.concat(chunks)); });
+    doc.on('error', e  => { clearTimeout(timeout); reject(e); });
 
-  let u = String(SMTP_FALLBACK_LOGIN || "").trim();
-  if (u && !looksLikeBrevoSecret(u)) return u;
-  u = String(SMTP_FALLBACK_USER || "").trim();
-  if (u && !looksLikeBrevoSecret(u)) return u;
-  const j = readSmtpJsonFile();
-  u = String(j.user || j.login || "").trim();
-  if (u && !looksLikeBrevoSecret(u)) return u;
-  return "";
+    const GOLD = '#c98a1a', GOLD2 = '#e6a020', MUTED = '#9a8060';
+    const BG   = '#0f0d08', CARD  = '#161410', BORDER = '#2e2418';
+
+    // Fondo
+    doc.rect(0, 0, doc.page.width, doc.page.height).fill(BG);
+    // Barra dorada
+    doc.rect(0, 0, doc.page.width, 5).fill(GOLD);
+
+    // Logo
+    if (LOGO_BUFFER) {
+      try {
+        const lx = (doc.page.width - 70) / 2;
+        doc.image(LOGO_BUFFER, lx, 20, { width: 70, height: 70 });
+      } catch (_) {}
+    }
+
+    // Encabezado
+    doc.y = 100;
+    doc.font('Helvetica-Bold').fontSize(22).fillColor(GOLD2).text('Maná Alimentos', { align: 'center' });
+    doc.font('Helvetica').fontSize(12).fillColor('#c8b898').text('Cotización de Pedido', { align: 'center' });
+    doc.moveDown(0.25);
+    doc.font('Helvetica').fontSize(9).fillColor(MUTED)
+       .text('Generado el ' + new Date().toLocaleString('es-MX', {
+         weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit'
+       }), { align: 'center' });
+
+    // Número de folio único
+    const folio = 'MANA-' + Date.now().toString(36).toUpperCase();
+    doc.moveDown(0.2);
+    doc.font('Helvetica-Bold').fontSize(8).fillColor(GOLD)
+       .text('Folio: ' + folio, { align: 'center' });
+
+    // Línea dorada
+    doc.moveDown(0.7);
+    doc.moveTo(50, doc.y).lineTo(doc.page.width - 50, doc.y)
+       .strokeColor(GOLD).lineWidth(0.8).stroke();
+    doc.moveDown(0.8);
+
+    // Función sección con manejo de página
+    function seccion(titulo, campos) {
+      // Si queda poco espacio, saltar página
+      if (doc.y > doc.page.height - 180) {
+        doc.addPage();
+        doc.rect(0, 0, doc.page.width, doc.page.height).fill(BG);
+        doc.rect(0, 0, doc.page.width, 5).fill(GOLD);
+        doc.moveDown(1);
+      }
+      const y0 = doc.y;
+      doc.rect(45, y0 - 5, doc.page.width - 90, 22).fill(CARD);
+      doc.rect(45, y0 - 5, 3, 22).fill(GOLD);
+      doc.font('Helvetica-Bold').fontSize(10).fillColor(GOLD2).text(titulo, 56, y0 + 4);
+      doc.moveDown(1);
+
+      campos.forEach(([label, valor]) => {
+        if (!valor || String(valor).trim() === '' || valor === 'undefined') return;
+        doc.font('Helvetica-Bold').fontSize(8).fillColor(MUTED).text(label.toUpperCase(), 55, doc.y);
+        doc.font('Helvetica').fontSize(10).fillColor('#e8dcc8').text(String(valor), 55, doc.y);
+        doc.moveDown(0.35);
+      });
+
+      doc.moveDown(0.5);
+      doc.moveTo(50, doc.y).lineTo(doc.page.width - 50, doc.y)
+         .strokeColor(BORDER).lineWidth(0.5).stroke();
+      doc.moveDown(0.7);
+    }
+
+    const coloresStr = Array.isArray(data.colores)
+      ? data.colores.join(', ') : (data.colores || '—');
+
+    seccion('INFORMACIÓN DEL CLIENTE', [
+      ['Nombre',   data.nombre],
+      ['Teléfono', data.telefono],
+      ['Correo',   data.correo],
+    ]);
+    seccion('DATOS DE ENTREGA', [
+      ['Dirección',     data.direccion],
+      ['Fecha',         data.fecha],
+      ['Hora',          data.hora],
+      ['Notas entrega', data.notasEntrega || '—'],
+    ]);
+    seccion('ESPECIFICACIONES DEL PASTEL', [
+      ['Tamaño',         data.tamano],
+      ['Número de pisos',data.pisos],
+      ['Sabor bizcocho', data.saborBizcocho],
+      ['Relleno',        data.relleno],
+      ['Cobertura',      data.cobertura],
+    ]);
+    seccion('DISEÑO', [
+      ['Tipo de diseño',          data.tipoDiseno],
+      ['Colores solicitados',     coloresStr],
+      ['Estilo / preferencia',    data.estiloChef || '—'],
+    ]);
+    seccion('DEDICATORIA Y NOTAS', [
+      ['Texto en el pastel', data.dedicatoria || '—'],
+      ['Comentarios',        data.comentarios || '—'],
+    ]);
+
+    // Imagen de referencia en página aparte
+    if (imagenBuffer) {
+      doc.addPage();
+      doc.rect(0, 0, doc.page.width, doc.page.height).fill(BG);
+      doc.rect(0, 0, doc.page.width, 5).fill(GOLD);
+      doc.y = 50;
+      doc.font('Helvetica-Bold').fontSize(13).fillColor(GOLD2)
+         .text('Imagen de referencia del cliente', { align: 'center' });
+      doc.moveDown(1);
+      try {
+        doc.image(imagenBuffer, {
+          fit: [doc.page.width - 100, 390],
+          align: 'center',
+        });
+      } catch (_) {
+        doc.font('Helvetica').fontSize(10).fillColor(MUTED)
+           .text('No se pudo renderizar la imagen de referencia.', { align: 'center' });
+      }
+    }
+
+    // Pie de página en TODAS las páginas
+    const range = doc.bufferedPageRange();
+    for (let i = 0; i < range.count; i++) {
+      doc.switchToPage(range.start + i);
+      doc.font('Helvetica').fontSize(7.5).fillColor('#3a2e1e')
+         .text(
+           `Maná Alimentos · Folio ${folio} · Cotización generada automáticamente`,
+           50, doc.page.height - 32,
+           { align: 'center', width: doc.page.width - 100 }
+         );
+    }
+
+    doc.end();
+  });
 }
 
-/**
- * Valor "usuario" para auth (puede ser la clave si está mal colocada; createTransporter lo corrige).
- * Importante: si solo existe SMTP_USER con xsmtpsib, antes quedaba "" y fallaba siempre.
- */
-function getSmtpUser() {
-  const bundled = readBundledSmtpFromEnv();
-  if (bundled && bundled.user) return bundled.user;
+// ─── HTML base para correos ───────────────────────────────────────────────────
+function buildTablaHTML(data) {
+  const coloresStr = Array.isArray(data.colores)
+    ? data.colores.join(', ') : (data.colores || '—');
 
-  let u = getSmtpLoginOnly();
-  if (u) return u;
-  u = String(SMTP_FALLBACK_USER || "").trim();
-  if (!u) u = readSmtpJsonFile().user;
-  if (!u) u = envRaw("SMTP_USER");
-  if (!u) u = envRaw("BREVO_SMTP_LOGIN");
-  return u;
-}
-
-function getSmtpPass() {
-  const bundled = readBundledSmtpFromEnv();
-  if (bundled && bundled.pass) return bundled.pass;
-
-  for (const k of ["SMTP_USER", "SMTP_PIPE"]) {
-    const pc = parseSmtpPipeCombined(envRaw(k));
-    if (pc && pc.pass) return pc.pass;
-  }
-
-  const passKeys = [
-    "SMTP_PASS",
-    "SMTP_PASSWORD",
-    "BREVO_SMTP_KEY",
-    "BREVO_SMTP_PASSWORD",
-    "SMTP_KEY",
-    "MAIL_PASSWORD",
-    "EMAIL_PASSWORD",
+  const filas = [
+    ['Nombre',        data.nombre],
+    ['Teléfono',      data.telefono],
+    ['Correo',        data.correo],
+    ['Dirección',     data.direccion],
+    ['Fecha',         data.fecha],
+    ['Hora',          data.hora],
+    ['Tamaño',        data.tamano],
+    ['Pisos',         data.pisos],
+    ['Bizcocho',      data.saborBizcocho],
+    ['Relleno',       data.relleno],
+    ['Cobertura',     data.cobertura],
+    ['Tipo diseño',   data.tipoDiseno],
+    ['Colores',       coloresStr],
+    ['Dedicatoria',   data.dedicatoria || '—'],
+    ['Comentarios',   data.comentarios || '—'],
   ];
-  for (const k of passKeys) {
-    const v = envRaw(k);
-    if (!v) continue;
-    const vpc = parseSmtpPipeCombined(v);
-    if (vpc && vpc.pass) return vpc.pass;
-    if (!looksLikeBrevoSecret(v) && looksLikeBrevoSmtpLogin(v)) continue;
-    return v;
-  }
-  const maybeKeyInUser = envRaw("SMTP_USER");
-  const upc = parseSmtpPipeCombined(maybeKeyInUser);
-  if (upc && upc.pass) return upc.pass;
-  if (looksLikeBrevoSecret(maybeKeyInUser)) return maybeKeyInUser;
 
-  let p = String(SMTP_FALLBACK_PASS || "").trim();
-  if (!p) p = readSmtpJsonFile().pass;
-  return p;
+  return filas.map(([k, v]) => `
+    <tr>
+      <td style="padding:9px 14px;font-weight:700;color:#9a8060;font-size:11px;
+                 text-transform:uppercase;width:34%;background:#111111;
+                 border-bottom:1px solid #1e1a12">${k}</td>
+      <td style="padding:9px 14px;color:#f0e8d8;font-size:13px;
+                 background:#0f0d08;border-bottom:1px solid #1e1a12">${v}</td>
+    </tr>`).join('');
 }
 
-/** Si guardaste la clave por error en "usuario", recuperarla para auth. */
-function brevoPassFromMisassignedUser(rawUser, rawPass) {
-  if (looksLikeBrevoSecret(rawUser)) return rawUser;
-  if (looksLikeBrevoSecret(rawPass)) return rawPass;
-  return rawPass;
-}
+// ─── Ruta POST /api/pedido ────────────────────────────────────────────────────
+app.post('/api/pedido',
+  pedidoLimiter,
+  upload.single('imagen'),
+  async (req, res) => {
 
-function getFromEmail() {
-  let f = firstEnv(["FROM_EMAIL", "MAIL_FROM", "SMTP_FROM"]);
-  if (!f) f = String(SMTP_FALLBACK_FROM || "").trim();
-  if (!f) f = readSmtpJsonFile().from;
-  f = (f || "").trim();
-  // A veces se pega la clave SMTP en FROM_EMAIL; eso puede disparar errores raros de DNS.
-  if (looksLikeBrevoSecret(f)) f = "";
-  return f || getSmtpLoginOnly() || getSmtpUser();
-}
-
-const BREVO_SMTP_RELAY = "smtp-relay.brevo.com";
-
-function normalizeSmtpHost(raw) {
-  let h = String(raw || "")
-    .replace(/^\uFEFF/, "")
-    .trim();
-  const lower = h.toLowerCase();
-  // Clave API pegada por error como "host" (EBADNAME en DNS)
-  if (lower.includes("xsmtpsib-") || lower.includes("xkeysib-")) {
-    return BREVO_SMTP_RELAY;
-  }
-  if (h && !h.includes(".")) {
-    return BREVO_SMTP_RELAY;
-  }
-  return h || BREVO_SMTP_RELAY;
-}
-
-function getSmtpHost() {
-  let h = firstEnv(["SMTP_HOST"]);
-  if (!h) h = readSmtpJsonFile().host;
-  return normalizeSmtpHost(h);
-}
-
-function getSmtpPort() {
-  let p = firstEnv(["SMTP_PORT"]);
-  if (!p) p = readSmtpJsonFile().port;
-  const n = parseInt(String(p || "587"), 10);
-  return Number.isFinite(n) && n > 0 ? n : 587;
-}
-
-function createTransporter() {
-  let user = getSmtpUser();
-  let pass = getSmtpPass();
-
-  if (looksLikeBrevoSecret(user) && looksLikeBrevoSecret(pass)) {
-    pass = user === pass ? user : pass;
-    user = getSmtpLoginOnly();
-  } else if (looksLikeBrevoSecret(user)) {
-    pass = brevoPassFromMisassignedUser(user, pass);
-    user = getSmtpLoginOnly();
-  }
-
-  if (looksLikeBrevoSecret(user) && !looksLikeBrevoSecret(pass)) {
-    const tmp = user;
-    user = pass;
-    pass = tmp;
-  }
-
-  const host = normalizeSmtpHost(getSmtpHost());
-  const port = getSmtpPort();
-
-  if (!user || !pass) {
-    throw new Error(
-      "Error SMTP: Render no está pasando credenciales a Node. Crea SMTP_PIPE = tu_login@smtp-brevo.com|tu_clave_xsmtpsib (un | en medio) y Save + Manual Deploy. O SMTP_USER + SMTP_PASS. Comprueba /health → envKeyNamesMatching."
-    );
-  }
-  if (looksLikeBrevoSecret(user)) {
-    throw new Error(
-      "Error SMTP: el usuario debe ser el login SMTP (ej. a62653001@smtp-brevo.com), no la clave xsmtpsib-."
-    );
-  }
-
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    auth: { user, pass },
-  });
-}
-
-app.get("/health", (_req, res) => {
-  const user = getSmtpUser();
-  const pass = getSmtpPass();
-  const hasUser = Boolean(user);
-  const hasPass = Boolean(pass);
-  const fileOk = fs.existsSync(path.join(__dirname, "smtp.json"));
-  const envFileOk = fs.existsSync(path.join(__dirname, ".env"));
-  res.status(200).json({
-    ok: true,
-    /** Si esto no aparece en tu /health, Render no está sirviendo este código (revisa Root Directory y el último deploy). */
-    codeStamp: "pasteleria-smtp-v5-pipefix",
-    smtpConfigured: hasUser && hasPass,
-    hasSmtpLogin: Boolean(getSmtpLoginOnly()),
-    hasSmtpUser: hasUser,
-    hasSmtpPass: hasPass,
-    hasSmtpJsonFile: fileOk,
-    hasEnvFile: envFileOk,
-    /** Si falta algo, en Render → Environment crea SMTP_USER y SMTP_PASS y pulsa Save + Redeploy. */
-    renderEnvHint: {
-      SMTP_USER_set: Boolean(envRaw("SMTP_USER")),
-      SMTP_PASS_set: Boolean(envRaw("SMTP_PASS")),
-      SMTP_PIPE_set: Boolean(envRaw("SMTP_PIPE")),
-      BREVO_SMTP_JSON_set: Boolean(envRaw("BREVO_SMTP_JSON")),
-    },
-    /** Nombres de variables presentes (sin valores), por si hay un typo */
-    envKeyNamesMatching: Object.keys(process.env).filter((k) =>
-      /^(SMTP|BREVO|MAIL_|EMAIL_|FROM_)/i.test(k)
-    ),
-  });
-});
-
-/** Prueba real contra Brevo (sin enviar correo). Si falla, el mensaje viene del servidor SMTP. */
-app.get("/api/smtp-verify", async (_req, res) => {
-  try {
-    const transporter = createTransporter();
-    await transporter.verify();
-    res.status(200).json({ ok: true, brevo: "conexion-smtp-ok", codeStamp: "pasteleria-smtp-v5-pipefix" });
-  } catch (err) {
-    const msg = err?.message || "verify failed";
-    res.status(500).json({
-      ok: false,
-      error: msg,
-      codeStamp: "pasteleria-smtp-v5-pipefix",
-      hint:
-        "Si credenciales están bien: remitente FROM_EMAIL debe estar verificado en Brevo. Revisa también SMTP_PIPE (login|clave).",
-    });
-  }
-});
-
-async function handleSendOrder(req, res) {
-  try {
-    const { toEmail, replyTo, subject, text, pdfFilename, pdfBase64 } = req.body || {};
-
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "H4",
-      location: "server.js:handleSendOrder",
-      message: "body snapshot",
-      data: {
-        hasToEmail: Boolean(toEmail),
-        hasSubject: Boolean(subject),
-        hasText: Boolean(text),
-        hasPdfName: Boolean(pdfFilename),
-        pdfB64Len: pdfBase64 ? String(pdfBase64).length : 0,
-      },
-    });
-    // #endregion
-
-    if (!toEmail || !subject || !text || !pdfFilename || !pdfBase64) {
-      return res.status(400).json({ error: "Faltan datos obligatorios para enviar el pedido" });
+    // 1. Validar cuerpo
+    const errores = validarPedido(req.body);
+    if (errores.length) {
+      return res.status(400).json({ ok: false, error: 'Datos inválidos: ' + errores.join('; ') });
     }
 
-    // #region agent log
-    const _u = getSmtpUser();
-    const _p = getSmtpPass();
-    agentDebugLog({
-      hypothesisId: "H1",
-      location: "server.js:before createTransporter",
-      message: "smtp lengths (no secrets)",
-      data: {
-        userLen: _u ? String(_u).length : 0,
-        passLen: _p ? String(_p).length : 0,
-        pipeDefined: Boolean(envRaw("SMTP_PIPE")),
-        smtpUserDefined: Boolean(envRaw("SMTP_USER")),
-        smtpPassDefined: Boolean(envRaw("SMTP_PASS")),
-        smtpEnvKeyCount: Object.keys(process.env).filter((k) =>
-          /^(SMTP|BREVO|FROM_|MAIL_|EMAIL_)/i.test(k)
-        ).length,
-      },
-    });
-    // #endregion
+    // 2. Verificar magic bytes de la imagen (si se subió una)
+    let imagenBuffer = null;
+    if (req.file) {
+      if (!verificarMagicBytes(req.file.buffer, req.file.mimetype)) {
+        return res.status(400).json({ ok: false, error: 'El archivo de imagen está corrupto o no es válido.' });
+      }
+      imagenBuffer = req.file.buffer;
+    }
 
-    const transporter = createTransporter();
-    const fromEmail = getFromEmail();
+    // 3. Sanitizar todos los campos de texto
+    const data = {};
+    const camposTexto = ['nombre','telefono','correo','direccion','fecha','hora',
+                         'notasEntrega','tamano','tipoDiseno','estiloChef',
+                         'saborBizcocho','relleno','cobertura','pisos',
+                         'dedicatoria','comentarios'];
+    camposTexto.forEach(c => { data[c] = sanitize(req.body[c] || ''); });
 
-    await transporter.sendMail({
-      from: fromEmail,
-      to: toEmail,
-      replyTo: replyTo || fromEmail,
-      subject,
-      text,
-      attachments: [
-        {
-          filename: pdfFilename,
-          content: pdfBase64,
-          encoding: "base64",
-          contentType: "application/pdf",
-        },
-      ],
-    });
+    // Colores: array sanitizado
+    if (req.body.colores) {
+      const raw = Array.isArray(req.body.colores) ? req.body.colores : [req.body.colores];
+      data.colores = raw.map(c => sanitize(c)).filter(c => COLORES_VALIDOS.includes(c));
+    } else {
+      data.colores = [];
+    }
 
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "H2",
-      location: "server.js:handleSendOrder",
-      message: "sendMail ok",
-      data: { ok: true },
-    });
-    // #endregion
+    // 4. Generar PDF
+    let pdfBuffer;
+    try {
+      pdfBuffer = await generarPDF(data, imagenBuffer);
+    } catch (pdfErr) {
+      console.error('Error generando PDF:', pdfErr.message);
+      return res.status(500).json({ ok: false, error: 'No se pudo generar el PDF. Intenta de nuevo.' });
+    }
 
-    res.status(200).json({ ok: true, provider: "smtp" });
-  } catch (error) {
-    // #region agent log
-    agentDebugLog({
-      hypothesisId: "H2",
-      location: "server.js:handleSendOrder catch",
-      message: "send-order failed",
-      data: {
-        errType: error?.name || "Error",
-        errSlice: String(error?.message || "").slice(0, 160),
-      },
-    });
-    // #endregion
+    const nombreArchivo = `cotizacion-${data.nombre.replace(/[^a-zA-Z0-9]/g, '-')}-${Date.now()}.pdf`;
+    const tablaHTML = buildTablaHTML(data);
+    const estiloEmail = `font-family:sans-serif;max-width:620px;margin:auto;
+      background:#0a0a0a;border-radius:14px;overflow:hidden;
+      border:1px solid #2e2418;box-shadow:0 4px 24px rgba(0,0,0,0.4)`;
 
-    res.status(500).json({ error: error?.message || "Error interno al enviar pedido" });
+    // 5. Correo al chef/dueña (prioritario) — con reintento automático
+    try {
+      await enviarConReintento({
+        from:    `"Maná Alimentos" <${process.env.EMAIL_USER}>`,
+        to:      EMAIL_CHEF,
+        subject: `🎂 Cotización nueva — ${data.nombre} | Entrega: ${data.fecha}`,
+        html: `
+          <div style="${estiloEmail}">
+            <div style="background:linear-gradient(135deg,#c98a1a 0%,#a06c10 100%);
+                        padding:30px;text-align:center">
+              <p style="color:rgba(0,0,0,0.6);font-size:10px;letter-spacing:3px;
+                        margin:0 0 6px;text-transform:uppercase">Maná Alimentos</p>
+              <h1 style="color:#000;margin:0;font-size:22px;font-weight:800">
+                Nueva Cotización de Pastelería
+              </h1>
+              <p style="color:rgba(0,0,0,0.65);margin:8px 0 0;font-size:13px">
+                Recibida el ${new Date().toLocaleString('es-MX')}
+              </p>
+            </div>
+            <div style="padding:28px">
+              <table style="width:100%;border-collapse:collapse;border-radius:8px;overflow:hidden">
+                ${tablaHTML}
+              </table>
+              <div style="margin-top:24px;padding:14px;background:#161410;
+                          border-left:3px solid #c98a1a;border-radius:4px">
+                <p style="margin:0;color:#9a8060;font-size:12px">
+                  📎 El PDF con todos los detalles y la imagen de referencia (si aplica)
+                  está adjunto a este correo.
+                </p>
+              </div>
+            </div>
+          </div>`,
+        attachments: [
+          {
+            filename:    nombreArchivo,
+            content:     pdfBuffer,
+            contentType: 'application/pdf',
+          },
+          ...(imagenBuffer ? [{
+            filename:    req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_'),
+            content:     imagenBuffer,
+            contentType: req.file.mimetype,
+          }] : [])
+        ]
+      });
+    } catch (emailErr) {
+      // Si no se puede notificar al chef es un error crítico
+      console.error('❌ CRÍTICO: No se pudo enviar correo al chef después de 3 intentos:', emailErr.message);
+      return res.status(500).json({
+        ok: false,
+        error: 'Error al procesar el pedido. Por favor contáctanos directamente.'
+      });
+    }
+
+    // 6. Correo de confirmación al cliente (no crítico — si falla, el pedido igual se registró)
+    try {
+      await enviarConReintento({
+        from:    `"Maná Alimentos" <${process.env.EMAIL_USER}>`,
+        to:      data.correo,
+        subject: '¡Tu cotización fue recibida! — Maná Alimentos',
+        html: `
+          <div style="${estiloEmail}">
+            <div style="background:linear-gradient(135deg,#c98a1a 0%,#a06c10 100%);
+                        padding:30px;text-align:center">
+              <p style="color:rgba(0,0,0,0.6);font-size:10px;letter-spacing:3px;
+                        margin:0 0 6px;text-transform:uppercase">Maná Alimentos</p>
+              <h1 style="color:#000;margin:0;font-size:22px">
+                Hola, ${data.nombre} 👋
+              </h1>
+              <p style="color:rgba(0,0,0,0.65);margin:8px 0 0;font-size:13px">
+                Tu cotización fue recibida con éxito ✓
+              </p>
+            </div>
+            <div style="padding:28px;color:#f0e8d8">
+              <p style="font-size:15px;line-height:1.8;margin-bottom:22px">
+                Gracias por confiar en <strong style="color:#e6a020">Maná Alimentos</strong>.
+                Hemos recibido todos los detalles de tu pedido y nos pondremos en contacto
+                contigo a la brevedad para confirmar disponibilidad y darte el precio final.
+              </p>
+              <div style="background:#161410;border:1px solid #2e2418;
+                          border-left:3px solid #c98a1a;border-radius:8px;
+                          padding:18px;margin-bottom:22px">
+                <p style="margin:0 0 10px;font-size:11px;color:#9a8060;
+                           text-transform:uppercase;letter-spacing:.5px">
+                  Resumen de tu cotización
+                </p>
+                <p style="margin:5px 0;font-size:14px">
+                  <span style="color:#9a8060">Tamaño:</span>
+                  <strong>${data.tamano}</strong>
+                </p>
+                <p style="margin:5px 0;font-size:14px">
+                  <span style="color:#9a8060">Sabor:</span>
+                  <strong>${data.saborBizcocho}</strong>
+                </p>
+                <p style="margin:5px 0;font-size:14px">
+                  <span style="color:#9a8060">Fecha de entrega:</span>
+                  <strong>${data.fecha} a las ${data.hora}</strong>
+                </p>
+              </div>
+              <p style="color:#5a4a30;font-size:12px;text-align:center">
+                Adjunto a este correo encontrarás el PDF con el detalle completo de tu cotización.
+              </p>
+            </div>
+          </div>`,
+        attachments: [
+          {
+            filename:    `mi-cotizacion-mana.pdf`,
+            content:     pdfBuffer,
+            contentType: 'application/pdf',
+          }
+        ]
+      });
+    } catch (clienteErr) {
+      // No crítico — el pedido ya fue registrado y el chef ya recibió su correo
+      console.warn('⚠️ No se pudo enviar confirmación al cliente:', clienteErr.message);
+    }
+
+    // 7. Respuesta exitosa
+    return res.status(200).json({ ok: true });
   }
-}
+);
 
-// Ruta nueva (nuestra)
-app.post("/api/send-order", handleSendOrder);
-
-app.get("*", (_req, res) => {
-  res.sendFile(path.join(__dirname, "index.html"));
+// ─── Manejo global de errores de Multer ──────────────────────────────────────
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    const mensajes = {
+      LIMIT_FILE_SIZE:      'La imagen no puede superar 5 MB.',
+      LIMIT_UNEXPECTED_FILE:'Tipo de archivo no permitido. Solo JPG, PNG, WEBP.',
+    };
+    return res.status(400).json({ ok: false, error: mensajes[err.code] || err.message });
+  }
+  console.error('Error no manejado:', err);
+  return res.status(500).json({ ok: false, error: 'Error interno del servidor.' });
 });
 
+// ─── Ruta 404 ─────────────────────────────────────────────────────────────────
+app.use((req, res) => res.status(404).json({ ok: false, error: 'Ruta no encontrada.' }));
+
+// ─── Arrancar ─────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`Servidor escuchando en puerto ${PORT}`);
-  const okLogin = Boolean(getSmtpLoginOnly());
-  const okPass = Boolean(getSmtpPass());
-  if (!okLogin || !okPass) {
-    console.warn(
-      "[SMTP] Falta login o clave en este servidor. Render: Environment → SMTP_USER (…@smtp-brevo.com) y SMTP_PASS (xsmtpsib-…), luego Manual Deploy."
-    );
-  }
+  console.log(`\n🎂 Maná Alimentos — servidor corriendo en puerto ${PORT}`);
+  console.log(`   Email chef:   ${EMAIL_CHEF}`);
+  console.log(`   Email remite: ${process.env.EMAIL_USER}\n`);
 });
