@@ -19,15 +19,37 @@ const fs           = require('fs');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Verificar variables de entorno al arrancar ───────────────────────────────
-const REQUIRED_ENV = ['EMAIL_USER', 'EMAIL_PASS'];
-REQUIRED_ENV.forEach(key => {
-  if (!process.env[key]) {
-    console.error(`❌ FATAL: Variable de entorno ${key} no definida. El servidor no puede arrancar.`);
+const REGEX_EMAIL_ENV = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+// ─── Solo Gmail: Render debe tener exactamente estas tres variables ───────────
+['EMAIL_USER', 'EMAIL_PASS', 'EMAIL_CHEF'].forEach((key) => {
+  if (!process.env[key] || !String(process.env[key]).trim()) {
+    console.error(`❌ FATAL: Falta ${key}. En Render → Environment agrega solo: EMAIL_USER, EMAIL_PASS, EMAIL_CHEF.`);
     process.exit(1);
   }
 });
-const EMAIL_CHEF = process.env.EMAIL_CHEF || process.env.EMAIL_USER;
+
+const EMAIL_USER_TR = String(process.env.EMAIL_USER).trim();
+const EMAIL_PASS_TR = String(process.env.EMAIL_PASS).trim().replace(/\s+/g, '');
+const EMAIL_CHEF = String(process.env.EMAIL_CHEF).trim();
+
+if (!REGEX_EMAIL_ENV.test(EMAIL_USER_TR)) {
+  console.error('❌ FATAL: EMAIL_USER debe ser un correo válido.');
+  process.exit(1);
+}
+if (!REGEX_EMAIL_ENV.test(EMAIL_CHEF)) {
+  console.error('❌ FATAL: EMAIL_CHEF debe ser un correo válido.');
+  process.exit(1);
+}
+
+const SMTP_FROM = EMAIL_USER_TR;
+
+if (EMAIL_PASS_TR.length !== 16) {
+  console.warn(
+    '⚠️ Gmail: EMAIL_PASS debe ser la contraseña de aplicación de 16 letras (Google → Seguridad → Contraseñas de aplicaciones). ' +
+      `Tiene ${EMAIL_PASS_TR.length} caracteres.`
+  );
+}
 
 // ─── Helmet: cabeceras HTTP de seguridad ─────────────────────────────────────
 app.use(helmet({
@@ -168,8 +190,8 @@ function verificarMagicBytes(buffer, mimetype) {
 // ─── Nodemailer con verificación de conexión al arrancar ─────────────────────
 const transporter = nodemailer.createTransport({
   service: 'gmail',
-  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
-  pool: true,             // reutiliza conexiones
+  auth:    { user: EMAIL_USER_TR, pass: EMAIL_PASS_TR },
+  pool:    true,
   maxConnections: 3,
   rateDelta: 1000,
   rateLimit: 5,
@@ -178,9 +200,9 @@ const transporter = nodemailer.createTransport({
 transporter.verify((err) => {
   if (err) {
     console.error('❌ Error de conexión SMTP:', err.message);
-    console.error('   Verifica EMAIL_USER y EMAIL_PASS en las variables de entorno.');
+    console.error('   Revisa EMAIL_USER y EMAIL_PASS (contraseña de aplicación Gmail) en Render.');
   } else {
-    console.log('✅ SMTP conectado correctamente. Listo para enviar correos.');
+    console.log('✅ SMTP (Gmail) conectado. Listo para enviar correos.');
   }
 });
 
@@ -444,7 +466,7 @@ app.post('/api/pedido',
     // 5. Correo al chef/dueña (prioritario) — con reintento automático
     try {
       await enviarConReintento({
-        from:    `"Maná Alimentos" <${process.env.EMAIL_USER}>`,
+        from:    `"Maná Alimentos" <${SMTP_FROM}>`,
         to:      EMAIL_CHEF,
         subject: `🎂 Cotización nueva — ${data.nombre} | Entrega: ${data.fecha}`,
         html: `
@@ -498,7 +520,7 @@ app.post('/api/pedido',
     // 6. Correo de confirmación al cliente (no crítico — si falla, el pedido igual se registró)
     try {
       await enviarConReintento({
-        from:    `"Maná Alimentos" <${process.env.EMAIL_USER}>`,
+        from:    `"Maná Alimentos" <${SMTP_FROM}>`,
         to:      data.correo,
         subject: '¡Tu cotización fue recibida! — Maná Alimentos',
         html: `
@@ -583,5 +605,5 @@ app.use((req, res) => res.status(404).json({ ok: false, error: 'Ruta no encontra
 app.listen(PORT, () => {
   console.log(`\n🎂 Maná Alimentos — servidor corriendo en puerto ${PORT}`);
   console.log(`   Email chef:   ${EMAIL_CHEF}`);
-  console.log(`   Email remite: ${process.env.EMAIL_USER}\n`);
+  console.log(`   Email remite: ${SMTP_FROM}\n`);
 });

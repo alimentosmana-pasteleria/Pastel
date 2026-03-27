@@ -25,13 +25,13 @@ git push -u origin main
 
 ## 3. Variables de entorno en Render
 
-En tu servicio → **"Environment"** → agrega:
+En tu servicio → **"Environment"** → agrega **solo estas tres** (nada de SMTP_HOST ni otras):
 
 | Variable      | Valor                          |
 |---------------|-------------------------------|
-| EMAIL_USER    | tupasteleria@gmail.com         |
-| EMAIL_PASS    | tu contraseña de aplicación   |
-| EMAIL_CHEF    | chef@tupasteleria.com          |
+| EMAIL_USER    | tu correo Gmail que envía       |
+| EMAIL_PASS    | contraseña de aplicación (16 letras) |
+| EMAIL_CHEF    | correo donde recibes los pedidos (puede ser el mismo) |
 
 ### ¿Cómo obtener la contraseña de aplicación de Gmail?
 1. Ve a tu cuenta Google → Seguridad
